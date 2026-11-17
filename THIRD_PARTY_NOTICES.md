@@ -104,6 +104,8 @@ SOFTWARE.
 
 ## Protocol references (no code taken)
 
+- [PadForge issue #528](https://github.com/hifihedgehog/PadForge/issues/528) and the notes it cites: the layout
+  of the DualShock 4's Bluetooth microphone reports and how the mic is switched on.
 - [OpenChromaConnect/ChromaBroadcastAPI](https://github.com/OpenChromaConnect/ChromaBroadcastAPI):
   the Chroma Broadcast callback types and Razer's sample App ID.
 - Razer's Chroma Connect module (`RzChromaBroadcastAPI64.dll`) is loaded from the user's own Razer

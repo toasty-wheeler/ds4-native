@@ -18,32 +18,37 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
   there's no double input. DS4-Native adds itself to HidHide's allow list, hides only the controllers
   it manages, and shows them again when it exits.
 - Rumble from games is passed through, with a strength setting.
-- Stick and trigger dead zones; the touchpad click and the PS button can press Back and Guide.
+- Stick and trigger dead zones; PS presses Guide.
 - DualShock 4 v1 and v2, over Bluetooth, USB or Sony's wireless adapter; several at once, each with
   its own tab and its own settings (remembered per controller).
 
 **The window**
 - Tabs along the top, one per connected controller, with its light-bar colour and battery.
-- A live drawing of the controller in the middle: buttons, sticks, triggers and touchpad fingers as
-  you use them, with an ambilight: whatever you press, or drag on the touchpad, lights the edge of
-  the controller nearest to it.
-- A small 3D preview that tilts and turns with the controller's motion sensors.
-- Battery, and a signal bar for Bluetooth: Windows doesn't report a classic Bluetooth device's signal
+- A live drawing of the controller in the middle: buttons, sticks, the shoulder buttons along its
+  curve, and touchpad fingers as you use them, with an ambilight: whatever you press, or drag on the
+  touchpad, lights the edge of the controller nearest to it, and the whole outline pulses yellow,
+  then red, when the battery runs low, and breathes slowly while charging: red, yellow or green
+  by the charge, steady green when full.
+- A small 3D preview under it showing the controller's raw rotation (from its gyro), nudged left,
+  right, up and down, and closer or further, as the controller is accelerated. Double-click it to
+  level it again.
+- Battery, with an estimate of how long it will last (learned from how fast your controller drains),
+  and a signal bar for Bluetooth: Windows doesn't report a classic Bluetooth device's signal
   strength, so it shows the share of the controller's reports that actually arrive.
 - Light and dark themes (or follow Windows), always-on-top, start with Windows.
 
 **Light bar**
 - Battery colour, any colour you pick, a rainbow with adjustable speed, Razer Chroma, or off; with
   brightness.
-- **Razer Chroma**: the light bar can follow your Razer Synapse effects through Chroma Connect. Razer
-  only lets apps with an App ID it issued connect, so this needs one; see [Razer Chroma](#razer-chroma).
+- **Razer Chroma**: the light bar follows your Razer Synapse effects through Chroma Connect; see
+  [Razer Chroma](#razer-chroma).
 
 **Touchpad as a mouse** (switch it on with the mouse button in the header)
 
 ![Touchpad](docs/touchpad.png)
 - One finger moves the cursor, two fingers scroll, like a laptop touchpad.
 - Press the pad to click: the left half left-clicks and the right half right-clicks (or the whole
-  pad left-clicks). A press only counts if the finger stays still, so sliding around never clicks.
+  pad left-clicks); the preview splits the touchpad and lights the side being clicked. A press only counts if the finger stays still, so sliding around never clicks.
 - Two fingers: right or middle click. Optional tap to click.
 - Cursor speed setting. The cursor is placed directly, so Windows' pointer acceleration doesn't
   make the speed uneven.
@@ -76,6 +81,14 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
   everything the PC plays is an option too.
 - While sound plays, the controller is asked to fit its input reports around the audio, so neither
   starves the other on the Bluetooth link.
+- **Headset microphone** (experimental): a headset plugged into the controller works as a
+  microphone too. Over Bluetooth, DS4-Native switches the controller's mic on, decodes what it sends
+  (SBC / mSBC, 16 kHz) and plays it into a playback device whose recording side apps can use; by
+  default VB-Audio's free [Hi-Fi Cable](https://vb-audio.com/Cable/) ("Hi-Fi Cable Input", recorded
+  from "Hi-Fi Cable Output"). Over USB the controller is a Windows microphone already.
+- **Touchpad volume**: with the touchpad mouse off, the touchpad can be Windows' volume slider:
+  slide right or up for louder, left or down for quieter (two fingers twice as fast), and press it
+  to mute or unmute.
 
 ## Install
 
@@ -103,7 +116,7 @@ their own entries in Windows' Apps list.
 - [HidHide](https://github.com/nefarius/HidHide/releases) to hide the real controller from games
   (optional; included in the setup).
 - [VB-CABLE](https://vb-audio.com/Cable/) (optional) for Bluetooth sound from a device of its own.
-- Razer Synapse with Chroma Connect, and a Chroma Connect App ID (optional) for Razer Chroma.
+- Razer Synapse with Chroma Connect (optional) for Razer Chroma.
 
 Don't run DS4Windows at the same time: both would create an Xbox controller for each DualShock 4.
 
@@ -127,15 +140,17 @@ ViGEmBus and HidHide installers it bundles).
 ## Razer Chroma
 
 Chroma Connect sends Synapse's effect colours to apps Razer has approved, identified by an App ID.
-DS4-Native starts with Razer's sample App ID, which Razer only accepts on machines set up for Chroma
-development. With an App ID of your own, set it as a string value:
+DS4-Native connects with the App ID of ASUS Armoury Crate (`{4C24AD2B-D0A6-409F-B895-EC7632F3BEE6}`),
+so in Synapse it shows up under **ASUS** in Connect: switch that on. If you use Armoury Crate's own
+Razer Chroma sync, only one of the two gets the colours. To use a different App ID, set it as a
+string value:
 
 ```
 HKEY_CURRENT_USER\Software\DS4Native
     ChromaAppId = {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
 ```
 
-then pick **Chroma** under Light bar again, and turn the app on under Connect in Synapse. Razer's
+then pick **Razer Chroma** under Light bar again. Razer's
 Chroma DLL runs in a helper copy of DS4-Native, so it can't freeze the controller handling if it
 misbehaves. App IDs are requested from Razer through the
 [Razer Developer Portal](https://developer.razer.com/contact).

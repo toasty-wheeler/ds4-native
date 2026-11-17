@@ -35,6 +35,7 @@
 #include <mmsystem.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <endpointvolume.h>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -59,13 +60,14 @@
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 static const wchar_t kAppName[] = L"DS4-Native";
-static const wchar_t kVersion[] = L"1.0.0";
+static const wchar_t kVersion[] = L"1.1.0";
 static const wchar_t kRegKey[]  = L"Software\\DS4Native";
 static const wchar_t kRunKey[]  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const UINT WM_TRAY     = WM_APP + 1;
 static const UINT WM_PADS     = WM_APP + 2;     // a controller came, went or changed (from its thread)
 static const UINT WM_SHORTCUT = WM_APP + 3;     // a combo fired: wParam action, lParam buttons
 static const UINT WM_CHROMA   = WM_APP + 4;     // from the Chroma helper: wParam what, lParam value
+static const UINT WM_VOLUME   = WM_APP + 5;     // touchpad volume changed: wParam %, lParam muted
 enum TrayMenuId { ID_MENU_OPEN = 400, ID_MENU_ENABLED, ID_MENU_EXIT };
 static const float kPi = 3.14159265f;
 
@@ -77,7 +79,7 @@ enum Setting {
     S_LIGHTMODE, S_HUE, S_BRIGHT, S_DEADL, S_DEADR, S_DEADT, S_RUMBLEGAIN, S_RAINBOW,
     S_TPMOUSE, S_TPSPLIT, S_TPTWO, S_TPSCROLL, S_TPSPEED,       // the touchpad as a mouse
     S_AUDIO, S_AUDIOOUT, S_AUDIOVOL,                            // sound to the controller (Bluetooth)
-    S_TPTAP,
+    S_TPTAP, S_TPVOLUME, S_MIC,
     S_COUNT
 };
 enum LightMode { LIGHT_BATTERY, LIGHT_COLOUR, LIGHT_RAINBOW, LIGHT_CHROMA, LIGHT_OFF, LIGHT_COUNT };
@@ -87,10 +89,10 @@ static const wchar_t* const kSettingNames[S_COUNT] = {
     L"Emulate", L"Hide", L"Rumble", L"TouchpadBack", L"PsGuide", L"IdleSleep", L"Motion",
     L"Light", L"Hue", L"Brightness", L"DeadLeft", L"DeadRight", L"DeadTrigger", L"RumbleGain", L"RainbowSpeed",
     L"TouchMouse", L"TouchSplit", L"TouchTwoFinger", L"TouchScroll", L"TouchSpeed",
-    L"Audio", L"AudioOut", L"AudioVolume", L"TouchTap",
+    L"Audio", L"AudioOut", L"AudioVolume", L"TouchTap", L"TouchVolume", L"Mic",
 };
 static const int kSettingDefaults[S_COUNT] = { 1, 1, 1, 1, 1, 0, 1, LIGHT_BATTERY, 210, 40, 8, 8, 0, 100, 25,
-                                               0, 1, TWO_RIGHT, 1, 50, 0, AUDIO_JACK, 70, 0 };
+                                               0, 1, TWO_RIGHT, 1, 50, 0, AUDIO_JACK, 70, 0, 0, 0 };
 static const wchar_t* const kTwoFingerNames[TWO_COUNT] = { L"Right click", L"Middle click" };
 
 // Switch settings: title and detail.
@@ -107,12 +109,19 @@ static const struct { int setting; const wchar_t* title; const wchar_t* detail; 
     { S_TPSCROLL,  L"Two-finger scroll", L"Drag two fingers to scroll" },
     { S_AUDIO,     L"Sound to the controller", L"Plays a sound device on it" },
     { S_TPTAP,     L"Tap to click",      L"A quick tap clicks too" },
+    { S_TPVOLUME,  L"Touchpad volume",   L"Slide to change, click to mute" },
+    { S_MIC,       L"Headset microphone", L"To a recording device" },
 };
-static const int kEmulationToggles[] = { S_EMULATE, S_HIDE, S_RUMBLE, S_TOUCHBACK, S_PSGUIDE, S_IDLE, S_MOTION };
+static const int kEmulationToggles[] = { S_EMULATE, S_HIDE, S_RUMBLE, S_IDLE, S_MOTION };   // (Rumble strength under Rumble)
 static const int kEmulationCount = (int)ARRAYSIZE(kEmulationToggles);
 static const ULONGLONG kIdleMs = 10 * 60 * 1000;
 
 static std::atomic<bool> g_enabled{true};   // the master switch
+static bool g_testMic;                      // self-test (DS4NATIVE_MICDRY): mic on, decoded and counted, played nowhere
+static bool g_noInput;                      // self-test: never send input (mouse, keys, actions, virtual pad)
+static SRWLOCK g_dumpLock = SRWLOCK_INIT;   // ... and the first reports of each kind, in hex
+static std::string g_dump;
+static int g_dumpCount[256];
 enum ThemeMode { THEME_AUTO, THEME_LIGHT, THEME_DARK };
 static int  g_themeMode = THEME_AUTO;
 static bool g_onTop;
@@ -132,7 +141,7 @@ static void RegPut(const wchar_t* sub, const wchar_t* name, DWORD v) {
 }
 
 static void LoadGlobals() {
-    g_enabled = RegGet(nullptr, L"Enabled", 1) != 0;
+    g_enabled = true;                       // (no switch for it in the window any more: "Xbox controller" does it)
     g_themeMode = (int)min(RegGet(nullptr, L"Theme", THEME_AUTO), (DWORD)THEME_DARK);
     g_onTop = RegGet(nullptr, L"OnTop", 0) != 0;
 }
@@ -357,7 +366,7 @@ static const long kRzResourceDisabled = 4309, kRzAccessDenied = 5, kRzUnknownApp
 
 // Razer's sample/test App ID. Real use needs an App ID from Razer (registry value ChromaAppId),
 // or Chroma Connect's developer mode for this test ID.
-static const GUID kChromaSampleAppId = { 0x8fb61199, 0x44f5, 0x4c53, { 0xa7, 0x06, 0x74, 0x73, 0x73, 0xa2, 0x17, 0x96 } };
+static const GUID kDefaultChromaAppId = { 0x4c24ad2b, 0xd0a6, 0x409f, { 0xb8, 0x95, 0xec, 0x76, 0x32, 0xf3, 0xbe, 0xe6 } };
 
 static std::wstring ChromaDllPath() {
     wchar_t dir[MAX_PATH];
@@ -401,7 +410,7 @@ static int ChromaHelperMain(const wchar_t* args) {
         PostMessageW(g_chromaTarget, WM_CHROMA, CHROMA_MSG_INIT, -1);
         TerminateProcess(GetCurrentProcess(), 2);
     }
-    GUID id = kChromaSampleAppId;
+    GUID id = kDefaultChromaAppId;
     wchar_t text[64];
     DWORD size = sizeof(text);
     if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ChromaAppId", RRF_RT_REG_SZ, nullptr, text, &size) == ERROR_SUCCESS) {
@@ -476,10 +485,15 @@ struct PadState {
     short tx[2] = {}, ty[2] = {};       // 0..1919, 0..942
     int   battery = -1;                 // %, -1 unknown
     bool  charging = false;
+    bool  phones = false, mic = false;  // a headset / its microphone plugged into the jack
     bool  imu = false;                  // the motion sensors are in the reports
     short gyro[3] = {}, accel[3] = {};  // raw: ~16.4 per deg/s, ~8192 per g
-    float up[3] = { 0, 1, 0 };          // gravity in the pad's frame, smoothed (x right, y up, z towards you)
-    float yaw = 0;                      // turn from the gyro, drifting back to 0
+    // Motion (x right, y up, z towards you): the orientation is the gyro integrated, raw (it's
+    // only levelled from gravity when it starts or is reset), and `lin` is the acceleration other
+    // than gravity, in g, in the world's frame.
+    float q[4] = { 1, 0, 0, 0 };        // pad -> world rotation (w, x, y, z)
+    float lin[3] = {};
+    bool  oriented = false;
     BYTE  tid[2] = {};                  // touch ids: a new id is a new finger
     BYTE  counter = 0;                  // the report's own count (6 bits): gaps are lost reports
 };
@@ -506,7 +520,16 @@ struct Pad {
     HANDLE outputWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // something to send changed
     std::atomic<bool> writerStop{false};
     std::atomic<unsigned> audioSent{0}, audioFailed{0}, audioDropouts{0};
+    std::atomic<bool> micOn{false};     // its microphone is switched on (output thread)
+    std::atomic<bool> motionReset{false};   // level the motion preview again (double-click)
+    std::atomic<int>  minutesLeft{-1};  // battery estimate (-1: none, e.g. charging)
+    std::atomic<bool> estimateSure{false};
+    std::atomic<unsigned> micFrames{0}, micBad{0};
+    std::atomic<unsigned> micEcho{0};   // frames in the mic reports that are the music sent to it (skipped)
+    std::atomic<int> micTarget{-1};     // the target byte of the last mic report
+    std::atomic<bool> audioMuted{false};    // the controller's sound muted (touchpad volume)
     std::atomic<int> link{-1};          // % of the controller's reports that arrived (last ~2 s), -1 unknown
+    std::atomic<unsigned> crcBad{0};    // reports dropped as corrupted
     std::atomic<int> reportRate{0};     // reports a second
     // The input report interval asked for (output report byte 1). 4 normally; 0 while sound
     // plays: the controller then fits its reports into what the link has left (measured: at 4,
@@ -528,6 +551,7 @@ static std::set<std::wstring> g_serials;   // controllers in use (one reachable 
 static void LoadPadSettings(Pad* p) {
     for (int i = 0; i < S_COUNT; i++) p->set[i] = (int)RegGet(p->serial.c_str(), kSettingNames[i], kSettingDefaults[i]);
     p->set[S_LIGHTMODE] = min(p->set[S_LIGHTMODE].load(), (int)LIGHT_COUNT - 1);
+    if (g_testMic) p->set[S_MIC] = 1;
 }
 
 static void SavePadSettings(Pad* p) {
@@ -661,7 +685,11 @@ static bool ParseReport(const Pad* p, const BYTE* b, DWORD n, PadState& s, bool*
     const BYTE* d;
     bool full;
     *synced = true;
-    if (b[0] == 0x11 && n >= 46) { d = b + 2; full = true; }               // Bluetooth, extended
+    if (b[0] >= 0x11 && b[0] <= 0x19 && n >= 46) {                           // Bluetooth, extended
+        if (b[0] != 0x11 && !(b[1] & 0x80)) return false;                   // sound only, no state
+        d = b + 2;
+        full = true;
+    }
     else if (b[0] == 0x01 && n >= 10) { d = b; full = !p->bluetooth && n >= 44; }  // USB, or Bluetooth's basic report
     else return false;
     s.lx = d[1]; s.ly = d[2]; s.rx = d[3]; s.ry = d[4];
@@ -695,6 +723,8 @@ static bool ParseReport(const Pad* p, const BYTE* b, DWORD n, PadState& s, bool*
     }
     s.imu = true;
     s.charging = (d[30] & 0x10) != 0;
+    s.phones = (d[30] & 0x20) != 0;
+    s.mic = (d[30] & 0x40) != 0;
     int level = d[30] & 0x0F;
     s.battery = min(100, level * 100 / (s.charging ? 11 : 8));
     for (int i = 0; i < 2; i++) {
@@ -709,20 +739,47 @@ static bool ParseReport(const Pad* p, const BYTE* b, DWORD n, PadState& s, bool*
 
 // Smooths gravity out of the accelerometer (tilt) and integrates the gyro's turn (yaw),
 // letting the yaw drift back to straight ahead so the model never stays turned.
-static void UpdateMotion(PadState& s, float dt) {
-    if (!s.imu || dt <= 0) return;
-    float a[3] = { (float)s.accel[0], (float)s.accel[1], (float)s.accel[2] };
-    float len = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-    if (len > 2000) {
-        float k = 1 - expf(-dt / 0.06f), n = 0;
-        for (int i = 0; i < 3; i++) { s.up[i] += (a[i] / len - s.up[i]) * k; n += s.up[i] * s.up[i]; }
-        n = sqrtf(max(n, 1e-6f));
-        for (int i = 0; i < 3; i++) s.up[i] /= n;
-    }
-    s.yaw += s.gyro[1] / 16.4f * (kPi / 180) * dt;
-    s.yaw *= expf(-dt / 1.5f);
+static void QuatRotate(const float q[4], const float v[3], float out[3]) {
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+    float tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+    out[0] = v[0] + w * tx + (y * tz - z * ty);
+    out[1] = v[1] + w * ty + (z * tx - x * tz);
+    out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
+static void UpdateMotion(PadState& s, float dt, bool reset) {
+    if (!s.imu) return;
+    float a[3] = { s.accel[0] / 8192.0f, s.accel[1] / 8192.0f, s.accel[2] / 8192.0f };
+    float len = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    if (!s.oriented || reset) {             // level, facing forward, from where gravity points
+        if (len < 0.5f) return;
+        float ux = a[0] / len, uy = a[1] / len, uz = a[2] / len;
+        if (uy < -0.999f) { s.q[0] = 0; s.q[1] = 1; s.q[2] = 0; s.q[3] = 0; }
+        else {
+            float w = 1 + uy, x = -uz, z = ux, n = sqrtf(w * w + x * x + z * z);
+            s.q[0] = w / n; s.q[1] = x / n; s.q[2] = 0; s.q[3] = z / n;
+        }
+        s.lin[0] = s.lin[1] = s.lin[2] = 0;
+        s.oriented = true;
+        return;
+    }
+    if (dt <= 0) return;
+    // Raw rotation: the gyro (about 16.4 per degree a second) turns the pad in its own frame.
+    float wx = s.gyro[0] / 16.4f * (kPi / 180), wy = s.gyro[1] / 16.4f * (kPi / 180), wz = s.gyro[2] / 16.4f * (kPi / 180);
+    float* q = s.q;
+    float h = 0.5f * dt;
+    float dw = h * (-q[1] * wx - q[2] * wy - q[3] * wz), dx = h * (q[0] * wx + q[2] * wz - q[3] * wy);
+    float dy = h * (q[0] * wy + q[3] * wx - q[1] * wz), dz = h * (q[0] * wz + q[1] * wy - q[2] * wx);
+    q[0] += dw; q[1] += dx; q[2] += dy; q[3] += dz;
+    float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; i++) q[i] /= n;
+    // What's left of the accelerometer once gravity is taken out: the pad being moved.
+    float world[3];
+    QuatRotate(q, a, world);
+    world[1] -= 1;
+    float k = 1 - expf(-dt / 0.05f);
+    for (int i = 0; i < 3; i++) s.lin[i] += (world[i] - s.lin[i]) * k;
+}
 static void StickToXbox(BYTE x, BYTE y, int deadPercent, SHORT* ox, SHORT* oy) {
     float fx = (x - 127.5f) / 127.5f, fy = -(y - 127.5f) / 127.5f;
     float mag = sqrtf(fx * fx + fy * fy), dead = deadPercent / 100.0f;
@@ -743,7 +800,7 @@ static XUSB_REPORT ToXbox(Pad* p, const PadState& s, DWORD hold) {
     XUSB_REPORT r{};
     DWORD buttons = s.buttons & ~hold;
     for (const ButtonMap& m : kButtonMap) if (buttons & m.pad) r.wButtons |= m.xbox;
-    if ((buttons & B_PS) && p->set[S_PSGUIDE]) r.wButtons |= XUSB_GAMEPAD_GUIDE;
+    if (buttons & B_PS) r.wButtons |= XUSB_GAMEPAD_GUIDE;     // PS is always Guide
     if ((buttons & B_TOUCH) && p->set[S_TOUCHBACK]) r.wButtons |= XUSB_GAMEPAD_BACK;
     r.bLeftTrigger = (hold & B_L2) ? 0 : TriggerToXbox(s.l2, p->set[S_DEADT]);
     r.bRightTrigger = (hold & B_R2) ? 0 : TriggerToXbox(s.r2, p->set[S_DEADT]);
@@ -771,7 +828,8 @@ static bool WriteReport(Pad* p, const BYTE* buf, DWORD len, bool fallback);
 
 // audio: 0 none, 1 switch the sound on to the headphone jack, 2 on to the speaker, 3 switch it
 // off again, 4 leave it playing (just keep it on; volumes aren't re-sent).
-struct PadOutput { BYTE weak, strong, r, g, b, audio, volume; };
+// mic: 0 none, 1 switch the microphone on, 2 keep it on, 3 switch it off.
+struct PadOutput { BYTE weak, strong, r, g, b, audio, volume, mic; };
 
 static bool WriteOutput(Pad* p, const PadOutput& o) {
     BYTE buf[128] = {};
@@ -780,15 +838,26 @@ static bool WriteOutput(Pad* p, const PadOutput& o) {
         len = 78;
         buf[0] = 0x11; buf[1] = (BYTE)(0xC0 | p->poll); buf[3] = 0x07;
         buf[6] = o.weak; buf[7] = o.strong; buf[8] = o.r; buf[9] = o.g; buf[10] = o.b;
-        if (o.audio == 4) {
-            buf[2] = 0xA0;
-        } else if (o.audio) {               // volumes valid; sound on (0xA0, 0x85) or off
+        // Byte 2: 0xA0 while sound plays, 0xA1 while the microphone is on too (or alone).
+        bool mic = o.mic == 1 || o.mic == 2, speaker = o.audio == 1 || o.audio == 2 || o.audio == 4;
+        if (speaker || mic) buf[2] = mic ? 0xA1 : 0xA0;
+        if (o.audio == 1 || o.audio == 2) {     // volumes valid; sound on (0x85 latches it)
             buf[3] |= 0xF0;
-            bool on = o.audio != 3;
-            buf[2] = on ? 0xA0 : 0x00;
             buf[21] = buf[22] = o.audio == 1 ? o.volume : 0;
+            buf[23] = mic ? 0x40 : 0;
             buf[24] = o.audio == 2 ? o.volume : 0;
-            buf[25] = on ? 0x85 : 0x00;
+            buf[25] = 0x85;
+        } else if (o.audio == 3) {              // sound off (the mic may stay on)
+            buf[3] |= mic ? 0xB0 : 0xF0;
+            buf[25] = mic ? 0x85 : 0x00;
+        }
+        if (o.mic == 1) {                       // microphone on, gain 0x40 (its ceiling)
+            buf[3] |= 0x40;
+            buf[23] = 0x40;
+            buf[25] = 0x85;
+        } else if (o.mic == 3) {
+            buf[3] |= 0x40;
+            buf[23] = 0;
         }
         SignReport(buf, len);
     } else {
@@ -850,6 +919,7 @@ static VOID CALLBACK OnXboxNotification(PVIGEM_CLIENT, PVIGEM_TARGET, UCHAR stro
 }
 
 static void SetEmulating(Pad* p, bool on) {
+    if (g_noInput) on = false;              // a test run never creates the virtual pad
     if (on == (p->target != nullptr)) return;
     AcquireSRWLockExclusive(&g_vigemLock);
     if (on) {
@@ -876,6 +946,7 @@ static void SetEmulating(Pad* p, bool on) {
 // ---- shortcut actions (on the controller's thread)
 
 static void SendKeys(std::initializer_list<WORD> keys) {
+    if (g_noInput) return;
     INPUT in[8] = {};
     int n = 0;
     for (WORD k : keys) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = k; n++; }
@@ -886,6 +957,7 @@ static void SendKeys(std::initializer_list<WORD> keys) {
 }
 
 static void RunAction(Pad* p, int action, DWORD buttons) {
+    if (g_noInput) return;
     switch (action) {
     case A_DISCONNECT:    DisconnectBluetooth(p); break;
     case A_EMULATION:     g_enabled = !g_enabled; RegPut(nullptr, L"Enabled", g_enabled); break;
@@ -938,6 +1010,7 @@ static const ULONGLONG kPressHoldMs = 250, kTapMs = 200;
 static const float kPressSlide = 40, kTapSlide = 40;     // touch units
 
 static void MouseInput(DWORD flags, LONG dx = 0, LONG dy = 0, DWORD data = 0) {
+    if (g_noInput) return;
     INPUT in{};
     in.type = INPUT_MOUSE;
     in.mi.dx = dx;
@@ -1354,10 +1427,8 @@ class Sbc {
     int scale[2][kBands] = {}, bits[2][kBands] = {};
     bool joined[kBands] = {};
 
-    static const double* Matrix() {
-        static double m[kBands][kTaps];
-        static bool built;
-        if (built) return &m[0][0];
+public:
+    static const double* Prototype() {
         static const double proto[kTaps] = {
             0.00000000E+00,  1.56575398E-04,  3.43256425E-04,  5.54620202E-04,  8.23919506E-04,  1.13992507E-03,
             1.47640169E-03,  1.78371725E-03,  2.01182542E-03,  2.10371989E-03,  1.99454554E-03,  1.61656283E-03,
@@ -1374,6 +1445,15 @@ class Sbc {
             2.01182542E-03,  1.78371725E-03,  1.47640169E-03,  1.13992507E-03,  8.23919506E-04,  5.54620202E-04,
             3.43256425E-04,  1.56575398E-04,
         };
+        return proto;
+    }
+
+private:
+    static const double* Matrix() {
+        static double m[kBands][kTaps];
+        static bool built;
+        if (built) return &m[0][0];
+        const double* proto = Prototype();
         for (int band = 0; band < kBands; band++)
             for (int tap = 0; tap < kTaps; tap++)
                 m[band][tap] = proto[tap] * (((tap / 16) & 1) ? -1.0 : 1.0) *
@@ -1507,6 +1587,295 @@ public:
 
 }   // namespace audio
 
+// ---------------------------------------------------------------------------------------
+// The headset microphone over Bluetooth. While it's on (byte 2 = 0xA1 in the output reports,
+// renewed at least every ~4 s, here every 33 ms), the controller sends reports 0x12..0x19:
+// the state (if byte 1 bit 7), then from byte 78 (or 3 without state) a frame number, a target
+// byte and SBC or mSBC frames, 16 kHz mono. They're decoded and played into a playback device
+// (VB-Audio's Hi-Fi Cable by default), whose recording side apps then use as the microphone.
+// Layout from PadForge's and hbashton's notes (github.com/hifihedgehog/PadForge/issues/528).
+
+namespace micout {
+
+static const int kRate = 16000, kRing = 1 << 15;
+static float g_ring[kRing];
+static std::atomic<ULONGLONG> g_written{0};
+static std::atomic<bool> g_running{false}, g_stop{false}, g_reopen{false};
+static std::atomic<long> g_error{0};
+static std::atomic<void*> g_owner{nullptr};    // the one controller whose mic plays
+static bool g_dry;                              // testing (DS4NATIVE_MICDRY): decode and count, play nothing
+static HANDLE g_thread;
+static SRWLOCK g_lock = SRWLOCK_INIT;
+static std::wstring g_dest, g_deviceName;       // "" picks Hi-Fi Cable Input
+
+static std::wstring Dest() { AcquireSRWLockShared(&g_lock); std::wstring s = g_dest; ReleaseSRWLockShared(&g_lock); return s; }
+static std::wstring PlayingTo() { AcquireSRWLockShared(&g_lock); std::wstring s = g_deviceName; ReleaseSRWLockShared(&g_lock); return s; }
+
+static void SetDest(const std::wstring& id) {
+    AcquireSRWLockExclusive(&g_lock);
+    g_dest = id;
+    ReleaseSRWLockExclusive(&g_lock);
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"MicDestination", REG_SZ, id.c_str(), (DWORD)((id.size() + 1) * sizeof(wchar_t)));
+    g_reopen = true;
+}
+
+static void LoadDest() {
+    wchar_t buf[512];
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"MicDestination", RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS) g_dest = buf;
+}
+
+static void Push(const float* samples, int n) {
+    ULONGLONG w = g_written.load();
+    for (int i = 0; i < n; i++) g_ring[(w + i) & (kRing - 1)] = samples[i];
+    g_written.store(w + n);
+}
+
+static DWORD WINAPI RenderThread(LPVOID) {
+    if (g_dry) {
+        g_running = true;
+        while (!g_stop) Sleep(50);
+        g_running = false;
+        return 0;
+    }
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    timeBeginPeriod(1);
+    while (!g_stop) {
+        IMMDeviceEnumerator* en = nullptr;
+        IMMDevice* dev = nullptr;
+        IAudioClient* client = nullptr;
+        IAudioRenderClient* render = nullptr;
+        WAVEFORMATEX* fmt = nullptr;
+        g_reopen = false;
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en);
+        if (SUCCEEDED(hr)) {
+            std::wstring id = Dest();
+            if (id.empty()) {
+                for (const audio::Device& d : audio::ListDevices(en))
+                    if (d.name.find(L"Hi-Fi Cable Input") != std::wstring::npos) { id = d.id; break; }
+            }
+            hr = id.empty() ? audio::kNoDevice : en->GetDevice(id.c_str(), &dev);
+        }
+        AcquireSRWLockExclusive(&g_lock);
+        g_deviceName = dev ? audio::DeviceName(dev) : L"";
+        ReleaseSRWLockExclusive(&g_lock);
+        if (SUCCEEDED(hr)) hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+        if (SUCCEEDED(hr)) hr = client->GetMixFormat(&fmt);
+        bool isFloat = false;
+        if (SUCCEEDED(hr)) {
+            isFloat = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                      (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && ((const WAVEFORMATEXTENSIBLE*)fmt)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+            if (!isFloat && fmt->wBitsPerSample != 16) hr = E_NOTIMPL;
+        }
+        if (SUCCEEDED(hr)) hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, fmt, nullptr);
+        if (SUCCEEDED(hr)) hr = client->GetService(__uuidof(IAudioRenderClient), (void**)&render);
+        UINT32 bufferFrames = 0;
+        if (SUCCEEDED(hr)) hr = client->GetBufferSize(&bufferFrames);
+        if (SUCCEEDED(hr)) hr = client->Start();
+        g_error = SUCCEEDED(hr) ? 0 : hr;
+        g_running = SUCCEEDED(hr);
+        if (SUCCEEDED(hr)) {
+            int channels = fmt->nChannels;
+            double step = (double)kRate / fmt->nSamplesPerSec, at = 0;     // ring position, fractional
+            bool started = false;
+            while (!g_stop && !g_reopen) {
+                Sleep(5);
+                UINT32 padding = 0;
+                if (FAILED(client->GetCurrentPadding(&padding))) break;
+                UINT32 room = bufferFrames - padding;
+                if (!room) continue;
+                ULONGLONG w = g_written.load();
+                // About 60 ms behind the controller; catch up if it falls far behind.
+                if (!started || at > (double)w || (double)w - at > 8000) { at = w > 960 ? (double)(w - 960) : 0; started = true; }
+                BYTE* data;
+                if (FAILED(render->GetBuffer(room, &data))) break;
+                for (UINT32 i = 0; i < room; i++) {
+                    float v = 0;
+                    if (at + 1 < (double)w) {
+                        ULONGLONG k = (ULONGLONG)at;
+                        float frac = (float)(at - k);
+                        v = g_ring[k & (kRing - 1)] * (1 - frac) + g_ring[(k + 1) & (kRing - 1)] * frac;
+                        at += step;
+                    }
+                    for (int c = 0; c < channels; c++) {
+                        if (isFloat) ((float*)data)[i * channels + c] = v;
+                        else ((short*)data)[i * channels + c] = (short)max(-32768.0f, min(32767.0f, v * 32767));
+                    }
+                }
+                render->ReleaseBuffer(room, 0);
+            }
+            client->Stop();
+        }
+        g_running = false;
+        if (fmt) CoTaskMemFree(fmt);
+        if (render) render->Release();
+        if (client) client->Release();
+        if (dev) dev->Release();
+        if (en) en->Release();
+        for (int i = 0; i < 40 && !g_stop && !g_reopen; i++) Sleep(50);
+    }
+    timeEndPeriod(1);
+    CoUninitialize();
+    return 0;
+}
+
+static void Want(bool want) {
+    if (want && !g_thread) {
+        g_stop = false;
+        g_thread = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
+    } else if (!want && g_thread) {
+        g_stop = true;
+        WaitForSingleObject(g_thread, 3000);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+        g_running = false;
+    }
+}
+
+}   // namespace micout
+
+// SBC decoder (Bluetooth A2DP specification, SBC; mSBC is SBC with fixed settings): frames of
+// 8 subbands, any mode; mono out (stereo is averaged). Samples come out scaled to -1..1.
+class SbcDecoder {
+    double v[2][160] = {};
+
+    static void Allocate(const int scf[2][8], int bits[2][8], int channels, int mode, bool loudness, int fsIndex, int bitpool) {
+        static const int offset8[4][8] = { { -2, 0, 0, 0, 0, 0, 0, 1 }, { -3, 0, 0, 0, 0, 0, 1, 2 },
+                                           { -4, 0, 0, 0, 0, 0, 1, 2 }, { -4, 0, 0, 0, 0, 0, 1, 2 } };
+        int need[2][8];
+        for (int c = 0; c < channels; c++)
+            for (int sb = 0; sb < 8; sb++) {
+                if (!loudness) { need[c][sb] = scf[c][sb]; continue; }
+                if (scf[c][sb] == 0) { need[c][sb] = -5; continue; }
+                int l = scf[c][sb] - offset8[fsIndex][sb];
+                need[c][sb] = l > 0 ? l / 2 : l;
+            }
+        // Mono and dual channel allocate per channel; stereo and joint stereo over both.
+        int groups = (mode == 0 || mode == 1) ? channels : 1, perGroup = (mode == 0 || mode == 1) ? 1 : channels;
+        for (int gidx = 0; gidx < groups; gidx++) {
+            int c0 = gidx, cn = perGroup;
+            int maxNeed = -100;
+            for (int c = c0; c < c0 + cn; c++) for (int sb = 0; sb < 8; sb++) maxNeed = max(maxNeed, need[c][sb]);
+            int count = 0, slice = 0, bitSlice = maxNeed + 1;
+            do {
+                bitSlice--;
+                count += slice;
+                slice = 0;
+                for (int c = c0; c < c0 + cn; c++)
+                    for (int sb = 0; sb < 8; sb++) {
+                        if (need[c][sb] > bitSlice + 1 && need[c][sb] < bitSlice + 16) slice++;
+                        else if (need[c][sb] == bitSlice + 1) slice += 2;
+                    }
+            } while (count + slice < bitpool);
+            if (count + slice == bitpool) { count += slice; bitSlice--; }
+            for (int c = c0; c < c0 + cn; c++)
+                for (int sb = 0; sb < 8; sb++) bits[c][sb] = need[c][sb] < bitSlice + 2 ? 0 : min(need[c][sb] - bitSlice, 16);
+            for (int pass = 0; pass < 2; pass++) {
+                int c = c0, sb = 0;
+                while (count < bitpool && sb < 8) {
+                    if (pass == 0) {
+                        if (bits[c][sb] >= 2 && bits[c][sb] < 16) { bits[c][sb]++; count++; }
+                        else if (need[c][sb] == bitSlice + 1 && count + 1 < bitpool) { bits[c][sb] = 2; count += 2; }
+                    } else if (bits[c][sb] < 16) {
+                        bits[c][sb]++;
+                        count++;
+                    }
+                    if (++c == c0 + cn) { c = c0; sb++; }
+                }
+            }
+        }
+    }
+
+public:
+    // The length of the frame at f (0 if it isn't one).
+    static int FrameLength(const BYTE* f, int avail) {
+        if (avail < 4) return 0;
+        if (f[0] == 0xAD) return 57;
+        if (f[0] != 0x9C || !(f[1] & 1)) return 0;
+        int blocks = 4 * (((f[1] >> 4) & 3) + 1), mode = (f[1] >> 2) & 3, bitpool = f[2], channels = mode == 0 ? 1 : 2;
+        int len = 4 + 4 * 8 * channels / 8;
+        if (mode == 0 || mode == 1) len += (blocks * channels * bitpool + 7) / 8;
+        else len += ((mode == 3 ? 8 : 0) + blocks * bitpool + 7) / 8;
+        return len;
+    }
+
+    // Decodes one frame; returns the number of samples written to out (up to 128), 0 if bad.
+    int Decode(const BYTE* f, int len, float* out) {
+        int fsIndex, blocks, mode, bitpool;
+        bool loudness;
+        if (f[0] == 0xAD) { fsIndex = 0; blocks = 15; mode = 0; loudness = true; bitpool = 26; }
+        else {
+            fsIndex = f[1] >> 6; blocks = 4 * (((f[1] >> 4) & 3) + 1); mode = (f[1] >> 2) & 3;
+            loudness = !((f[1] >> 1) & 1); bitpool = f[2];
+        }
+        if (FrameLength(f, len) != len) return 0;
+        int channels = mode == 0 ? 1 : 2;
+        int bit = 32;
+        auto get = [&](int n) {
+            unsigned v = 0;
+            for (int i = 0; i < n; i++, bit++) {
+                if ((bit >> 3) >= len) return v;
+                v = (v << 1) | ((f[bit >> 3] >> (7 - (bit & 7))) & 1);
+            }
+            return v;
+        };
+        bool join[8] = {};
+        if (mode == 3) for (int sb = 0; sb < 8; sb++) join[sb] = get(1) != 0;
+        int scf[2][8] = {}, bits[2][8] = {};
+        for (int c = 0; c < channels; c++) for (int sb = 0; sb < 8; sb++) scf[c][sb] = (int)get(4);
+        Allocate(scf, bits, channels, mode, loudness, fsIndex, bitpool);
+        double sample[16][2][8] = {};
+        for (int blk = 0; blk < blocks; blk++)
+            for (int c = 0; c < channels; c++)
+                for (int sb = 0; sb < 8; sb++) {
+                    if (!bits[c][sb]) continue;
+                    unsigned q = get(bits[c][sb]);
+                    double levels = (double)((1u << bits[c][sb]) - 1);
+                    sample[blk][c][sb] = (double)(1 << (scf[c][sb] + 1)) * ((q * 2.0 + 1.0) / levels - 1.0);
+                }
+        if (mode == 3)
+            for (int blk = 0; blk < blocks; blk++)
+                for (int sb = 0; sb < 8; sb++) {
+                    if (!join[sb]) continue;
+                    double m = sample[blk][0][sb], s = sample[blk][1][sb];
+                    sample[blk][0][sb] = m + s;
+                    sample[blk][1][sb] = m - s;
+                }
+        // Synthesis filter bank.
+        static double window[80], matrix[16][8];
+        static bool built;
+        if (!built) {
+            const double* proto = audio::Sbc::Prototype();
+            for (int i = 0; i < 80; i++) window[i] = -proto[i] * 8;     // -M x the analysis window
+            for (int k = 0; k < 16; k++)
+                for (int i = 0; i < 8; i++) matrix[k][i] = cos((i + 0.5) * (k + 4) * 3.14159265358979 / 8);
+            built = true;
+        }
+        for (int blk = 0; blk < blocks; blk++) {
+            double mix[8] = {};
+            for (int c = 0; c < channels; c++) {
+                double* V = v[c];
+                memmove(V + 16, V, sizeof(double) * 144);
+                for (int k = 0; k < 16; k++) {
+                    double sum = 0;
+                    for (int i = 0; i < 8; i++) sum += matrix[k][i] * sample[blk][c][i];
+                    V[k] = sum;
+                }
+                double U[80];
+                for (int i = 0; i < 5; i++)
+                    for (int j = 0; j < 8; j++) { U[i * 16 + j] = V[i * 32 + j]; U[i * 16 + 8 + j] = V[i * 32 + 24 + j]; }
+                for (int j = 0; j < 8; j++) {
+                    double x = 0;
+                    for (int i = 0; i < 10; i++) x += U[j + 8 * i] * window[j + 8 * i];
+                    mix[j] += x / channels;
+                }
+            }
+            for (int j = 0; j < 8; j++) out[blk * 8 + j] = (float)(mix[j] / 32768.0);
+        }
+        return blocks * 8;
+    }
+};
+
 // The controller's sound: report 0x17 with four SBC frames (16 ms), counted in frames.
 struct PadAudio {
     audio::Reader reader;
@@ -1526,10 +1895,13 @@ static double NowMs() {
 static void SendAudio(Pad* p, PadAudio& a) {
     short pcm[audio::kChunk][2];
     a.reader.Take(pcm);
+    float level = p->audioMuted ? 0.0f : p->set[S_AUDIOVOL] / 100.0f, gain = level * level;    // a gentle taper
+    if (gain < 0.999f)
+        for (int i = 0; i < audio::kChunk; i++) { pcm[i][0] = (short)(pcm[i][0] * gain); pcm[i][1] = (short)(pcm[i][1] * gain); }
     BYTE report[462] = {};
     report[0] = 0x17;
     report[1] = (BYTE)(0x40 | p->poll);
-    report[2] = 0xA0;                   // keeps the controller sending input while it plays
+    report[2] = p->micOn ? 0xA1 : 0xA0; // keeps the controller sending input while it plays
     report[3] = (BYTE)a.frame;
     report[4] = (BYTE)(a.frame >> 8);
     report[5] = p->set[S_AUDIOOUT] == AUDIO_SPEAKER ? 0x02 : 0x24;
@@ -1602,6 +1974,34 @@ static void SetReady(Pad* p, bool ready) {
     if (p->ready.exchange(ready) != ready) PostMessageW(g_tray, WM_PADS, ready, 0);
 }
 
+// Mic frames in reports 0x12..0x19: decoded into the mic output (one controller at a time).
+// Those reports also carry the sound being sent to the controller (32 kHz stereo SBC, as
+// encoded here), so only microphone frames (mSBC, or 16 kHz mono SBC) are taken.
+static bool MicFrame(const BYTE* f) {
+    if (f[0] == 0xAD) return true;
+    return f[0] == 0x9C && (f[1] >> 6) == 0 && ((f[1] >> 2) & 3) == 0;
+}
+
+static void TakeMic(Pad* p, const BYTE* b, DWORD n, SbcDecoder& decoder) {
+    if (b[0] < 0x12 || b[0] > 0x19 || !(b[2] & 0x80) || !p->micOn) return;
+    void* none = nullptr;
+    if (micout::g_owner != p && !micout::g_owner.compare_exchange_strong(none, p)) return;
+    int length = min((int)n, 78 + (b[0] - 0x11) * 64);
+    int block = (b[1] & 0x80) ? 78 : 3;
+    if (block + 3 >= length) return;
+    p->micTarget = b[block + 2];
+    int pos = block + 3, end = length - 4;     // after the frame number and target byte
+    float pcm[128];
+    while (pos < end) {
+        int len = SbcDecoder::FrameLength(b + pos, end - pos);
+        if (!len || pos + len > end) break;
+        if (!MicFrame(b + pos)) { p->micEcho++; pos += len; continue; }
+        int samples = decoder.Decode(b + pos, len, pcm);
+        if (samples) { micout::Push(pcm, samples); p->micFrames++; }
+        else p->micBad++;
+        pos += len;
+    }
+}
 // Everything sent to the controller, on its own thread so reading input never waits on a
 // write: rumble and light bar when they change (at most every 10 ms, or 25 ms while the colour
 // keeps changing), and the sound reports every 16 ms on a high-resolution timer.
@@ -1612,6 +2012,7 @@ static DWORD WINAPI OutputThread(LPVOID param) {
     PadOutput sent{};
     bool everSent = false, disarmAudio = false;
     int armedOut = -1, armedVolume = -1;    // what the sound was switched on with (-1: not on)
+    bool micArm = false, micDisarm = false; // the microphone's on / off still to be sent
     ULONGLONG lastWrite = 0;
     PadAudio padAudio;
     while (!p->writerStop) {
@@ -1639,6 +2040,7 @@ static DWORD WINAPI OutputThread(LPVOID param) {
         ULONGLONG now = GetTickCount64();
         AcquireSRWLockShared(&p->lock);
         int battery = p->state.battery;
+        bool headsetMic = p->state.mic;
         ReleaseSRWLockShared(&p->lock);
 
         PadOutput out{};
@@ -1653,10 +2055,19 @@ static DWORD WINAPI OutputThread(LPVOID param) {
         int bright = p->set[S_BRIGHT];
         out.r = (BYTE)(rgb[0] * bright / 100); out.g = (BYTE)(rgb[1] * bright / 100); out.b = (BYTE)(rgb[2] * bright / 100);
         // Sound (Bluetooth only): switched on and off with the light bar's report.
+        bool wantMic = p->bluetooth && p->ready && p->set[S_MIC] && headsetMic && micout::g_running;
+        if (wantMic != p->micOn) {
+            p->micOn = wantMic;
+            micArm = wantMic;
+            micDisarm = !wantMic;
+            if (!wantMic && micout::g_owner == p) micout::g_owner = nullptr;
+            if (!p->pollFixed) p->poll = wantMic || p->audioOn ? 0 : 4;
+        }
+        out.mic = p->micOn ? (micArm ? 1 : 2) : micDisarm ? 3 : 0;
         bool wantAudio = p->bluetooth && p->ready && p->set[S_AUDIO] && audio::g_running;
         if (wantAudio != p->audioOn) {
             p->audioOn = wantAudio;
-            if (!p->pollFixed) p->poll = wantAudio ? 0 : 4;    // sent with the report below
+            if (!p->pollFixed) p->poll = wantAudio || p->micOn ? 0 : 4;    // sent with the report below
             if (wantAudio) {
                 padAudio.reader.started = false;
                 padAudio.sbc.Reset();
@@ -1667,7 +2078,7 @@ static DWORD WINAPI OutputThread(LPVOID param) {
         }
         // The sound is switched on once (and again only when its output or volume changes);
         // the light bar's reports in between just keep it on.
-        int outTo = p->set[S_AUDIOOUT] == AUDIO_SPEAKER ? 2 : 1, volume = p->set[S_AUDIOVOL] * 0x4F / 100;
+        int outTo = p->set[S_AUDIOOUT] == AUDIO_SPEAKER ? 2 : 1, volume = 0x4F;     // the Volume setting is applied to the samples
         bool arming = false;
         if (p->audioOn) {
             arming = outTo != armedOut || volume != armedVolume;
@@ -1680,9 +2091,12 @@ static DWORD WINAPI OutputThread(LPVOID param) {
         int mode = p->set[S_LIGHTMODE];
         bool rumbleChanged = everSent && (out.weak != sent.weak || out.strong != sent.strong);
         ULONGLONG gap = rumbleChanged || arming ? 10 : p->audioOn ? 50 : mode == LIGHT_RAINBOW || mode == LIGHT_CHROMA ? 25 : 10;
-        if (p->ready && (!everSent || arming || memcmp(&out, &sent, sizeof(out))) && now - lastWrite >= gap) {
+        bool keepMic = p->micOn && now - lastWrite >= 33;       // the mic switches itself off without these
+        if (p->ready && (!everSent || arming || keepMic || memcmp(&out, &sent, sizeof(out))) && (keepMic || now - lastWrite >= gap)) {
             bool ok = WriteOutput(p, out);
             if (ok && out.audio == 3) disarmAudio = false;
+            if (ok && out.mic == 1) micArm = false;
+            if (ok && out.mic == 3) micDisarm = false;
             if (ok && arming) {
                 armedOut = outTo;
                 armedVolume = volume;
@@ -1693,17 +2107,182 @@ static DWORD WINAPI OutputThread(LPVOID param) {
             lastWrite = now;
         }
     }
-    if (everSent && (sent.strong || sent.weak || p->audioOn)) {     // leave it quiet
+    if (everSent && (sent.strong || sent.weak || p->audioOn || p->micOn)) {     // leave it quiet
         sent.strong = sent.weak = 0;
         if (p->audioOn) sent.audio = 3;
+        if (p->micOn) sent.mic = 3;
         WriteOutput(p, sent);
     }
     p->audioOn = false;
+    p->micOn = false;
+    if (micout::g_owner == p) micout::g_owner = nullptr;
     if (timer) CloseHandle(timer);
     return 0;
 }
 
+// ---- the touchpad as a volume slider (Sound tab; only while it isn't the mouse)
+
+struct TouchVolume {
+    bool  had[2] = {};
+    BYTE  id[2] = {};
+    float x[2] = {}, y[2] = {};
+    IAudioEndpointVolume* endpoint = nullptr;   // Windows' default output, fetched as a finger lands
+    float level = 0;                            // the controller's volume while sliding (finer than 1 %)
+    bool  leveled = false;
+    ULONGLONG shown = 0;
+};
+
+static IAudioEndpointVolume* DefaultVolume() {
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    IAudioEndpointVolume* volume = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) {
+        if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dev))) {
+            dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&volume);
+            dev->Release();
+        }
+        en->Release();
+    }
+    return volume;
+}
+
+static void ShowVolume(IAudioEndpointVolume* volume) {
+    float level = 0;
+    BOOL muted = FALSE;
+    volume->GetMasterVolumeLevelScalar(&level);
+    volume->GetMute(&muted);
+    PostMessageW(g_tray, WM_VOLUME, (WPARAM)(level * 100 + 0.5f), muted);
+}
+
+// Sliding right or up turns it up (one finger: about a full slide across for 0..100%; two
+// fingers twice as fast); pressing the pad mutes or unmutes.
+static void UpdateTouchVolume(Pad* p, TouchVolume& v, const PadState& s, DWORD before, ULONGLONG now) {
+    int fingers = s.touch[0] + s.touch[1];
+    if (!p->set[S_TPVOLUME] || p->set[S_TPMOUSE] || !fingers) {
+        if (v.endpoint) { v.endpoint->Release(); v.endpoint = nullptr; }
+        if (v.had[0] || v.had[1]) SavePadSettings(p);      // the controller's volume, once the finger lifts
+        v.had[0] = v.had[1] = false;
+        v.leveled = false;
+        return;
+    }
+    // While sound goes to the controller (Bluetooth), that's what it controls: the Volume
+    // setting on the Sound tab. Otherwise (USB, or no sound to it) Windows' own volume.
+    bool own = p->audioOn;
+    if (!own && !v.endpoint) v.endpoint = DefaultVolume();
+    bool down = (s.buttons & B_TOUCH) != 0, wasDown = (before & B_TOUCH) != 0;
+    if (down && !wasDown) {
+        if (own) {
+            p->audioMuted = !p->audioMuted;
+            PostMessageW(g_tray, WM_VOLUME, p->set[S_AUDIOVOL], (p->audioMuted ? 1 : 0) | 2);
+        } else if (v.endpoint) {
+            BOOL muted = FALSE;
+            v.endpoint->GetMute(&muted);
+            v.endpoint->SetMute(!muted, nullptr);
+            ShowVolume(v.endpoint);
+        }
+    }
+    float dx = 0, dy = 0;
+    int same = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!s.touch[i] || !v.had[i] || v.id[i] != s.tid[i]) continue;
+        dx += s.tx[i] - v.x[i];
+        dy += s.ty[i] - v.y[i];
+        same++;
+    }
+    if (same && !down) {
+        float change = (dx - dy) / same * (fingers >= 2 ? 2.0f : 1.0f) / 1500.0f;
+        if (own && change != 0) {
+            v.level = max(0.0f, min(1.0f, (v.leveled ? v.level : p->set[S_AUDIOVOL] / 100.0f) + change));
+            v.leveled = true;
+            int percent = (int)(v.level * 100 + 0.5f);
+            if (percent != p->set[S_AUDIOVOL]) {
+                p->set[S_AUDIOVOL] = percent;
+                if (change > 0) p->audioMuted = false;
+                if (now - v.shown >= 40) { PostMessageW(g_tray, WM_VOLUME, percent, (p->audioMuted ? 1 : 0) | 2); v.shown = now; }
+            }
+        } else if (!own && v.endpoint && change != 0) {
+            float level = 0;
+            v.endpoint->GetMasterVolumeLevelScalar(&level);
+            float next = max(0.0f, min(1.0f, level + change));
+            if (next != level) {
+                v.endpoint->SetMasterVolumeLevelScalar(next, nullptr);
+                if (change > 0) v.endpoint->SetMute(FALSE, nullptr);
+                if (now - v.shown >= 40) { ShowVolume(v.endpoint); v.shown = now; }
+            }
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        v.had[i] = s.touch[i];
+        v.id[i] = s.tid[i];
+        if (s.touch[i]) { v.x[i] = s.tx[i]; v.y[i] = s.ty[i]; }
+    }
+}
+// ---- battery life: the trend over this charge, counted in hours the controller was on (as
+// in the Magic Mouse app): it starts from a typical drain (a DS4 lasts ~6 hours) or the rate
+// learned on earlier charges, and moves to the measured one as the level drops. Kept per
+// controller across restarts.
+
+struct BatterySample { float hours; int level; };
+
+struct BatteryLife {
+    std::vector<BatterySample> samples;
+    double hours = 0;                   // time on, this charge
+    double learned = 0;                 // hours per %, from earlier charges (0: none yet)
+    ULONGLONG tick = 0;
+    bool charging = false;
+};
+static const double kTypicalHoursPerPercent = 0.06, kPriorWeightHours = 0.5, kSureAfterHours = 0.5;
+
+static void SaveBatteryLife(Pad* p, const BatteryLife& b) {
+    std::wstring key = std::wstring(kRegKey) + L"\\" + p->serial;
+    static BatterySample none;
+    RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"BatteryHistory", REG_BINARY, b.samples.empty() ? &none : b.samples.data(),
+                    (DWORD)(b.samples.size() * sizeof(BatterySample)));
+}
+
+static void LoadBatteryLife(Pad* p, BatteryLife& b) {
+    std::wstring key = std::wstring(kRegKey) + L"\\" + p->serial;
+    BatterySample saved[64];
+    DWORD size = sizeof(saved);
+    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"BatteryHistory", RRF_RT_REG_BINARY, nullptr, saved, &size) == ERROR_SUCCESS)
+        b.samples.assign(saved, saved + size / sizeof(BatterySample));
+    if (!b.samples.empty()) b.hours = b.samples.back().hours;
+    b.learned = RegGet(p->serial.c_str(), L"BatteryMinutesPerTenPercent", 0) / 600.0;
+}
+
+static void UpdateBatteryLife(Pad* p, BatteryLife& b, const PadState& s, ULONGLONG now) {
+    if (s.battery < 0 || (b.tick && now - b.tick < 1000)) return;
+    double dt = b.tick ? min((now - b.tick) / 3600000.0, 5.0 / 3600) : 0;
+    b.tick = now;
+    if (s.charging) {                       // a new charge starts the trend again
+        if (!b.charging) { b.samples.clear(); b.hours = 0; SaveBatteryLife(p, b); }
+        b.charging = true;
+        p->minutesLeft = -1;
+        return;
+    }
+    b.charging = false;
+    b.hours += dt;
+    int level = s.battery;
+    if (!b.samples.empty() && level >= b.samples.back().level + 25) { b.samples.clear(); b.hours = 0; }   // charged elsewhere
+    if (b.samples.empty() || level != b.samples.back().level || b.hours - b.samples.back().hours >= 0.25) {
+        b.samples.push_back({ (float)b.hours, level });
+        if (b.samples.size() > 64) b.samples.erase(b.samples.begin());
+        double span = b.hours - b.samples.front().hours, drop = b.samples.front().level - level;
+        if (span >= 1 && drop >= 20) {      // remembered for the next charges
+            b.learned = span / drop;
+            RegPut(p->serial.c_str(), L"BatteryMinutesPerTenPercent", (DWORD)(b.learned * 600));
+        }
+        SaveBatteryLife(p, b);
+    }
+    double prior = b.learned > 0 ? b.learned : kTypicalHoursPerPercent;
+    double span = b.hours - b.samples.front().hours, drop = max(0, b.samples.front().level - level);
+    double perHour = (drop + kPriorWeightHours / prior) / (span + kPriorWeightHours);
+    p->minutesLeft = (int)(level / perHour * 60);
+    p->estimateSure = span >= kSureAfterHours;
+}
+
 static DWORD WINAPI PadThread(LPVOID param) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);      // the volume control
     Pad* p = (Pad*)param;
     bool claimed = false;
     if (OpenPad(p)) {
@@ -1726,12 +2305,17 @@ static DWORD WINAPI PadThread(LPVOID param) {
         bool psComboUsed = false;
         const ULONGLONG kPsDelayMs = 250;
         TouchMouse touchMouse;
+        TouchVolume touchVolume;
+        SbcDecoder micDecoder;
+        BatteryLife batteryLife;
+        LoadBatteryLife(p, batteryLife);
         // Link quality: the reports' own counter says how many were sent; the share that
         // arrived, over ~2 s windows.
         ULONGLONG linkStart = GetTickCount64();
         int linkGot = 0, linkSent = 0;
         bool haveCounter = false;
         BYTE lastCounter = 0;
+        int crcFails[9] = {};                // per report 0x11..0x19, in a row
         if (!p->dongle) SetReady(p, true);
         p->writerStop = false;
         HANDLE writer = CreateThread(nullptr, 0, OutputThread, p, 0, nullptr);
@@ -1754,6 +2338,33 @@ static DWORD WINAPI PadThread(LPVOID param) {
             ULONGLONG now = GetTickCount64();
             bool synced = true;
             PadState next = state;
+            // Bluetooth reports end in a CRC-32 of 0xA1 + the report: a corrupted one is dropped, so
+            // garbage never turns into button presses or clicks. (If a report kind never matches,
+            // its length is guessed wrong: after 50 in a row it's taken unchecked.)
+            if (got && p->bluetooth && n > 0 && buf[0] >= 0x11 && buf[0] <= 0x19) {
+                DWORD len = buf[0] == 0x19 ? 547 : 78 + (buf[0] - 0x11) * 64;
+                int& fails = crcFails[buf[0] - 0x11];
+                if (len <= n && fails < 50) {
+                    BYTE seed = 0xA1;
+                    DWORD crc = ~Crc32(buf.data(), len - 4, Crc32(&seed, 1)), stored;
+                    memcpy(&stored, buf.data() + len - 4, 4);
+                    if (crc != stored) { fails++; p->crcBad++; got = false; }
+                    else fails = 0;
+                }
+            }
+            if (got && n > 0 && g_testMic) {    // testing: keep the first few reports of each kind
+                AcquireSRWLockExclusive(&g_dumpLock);
+                if (g_dump.size() < 40000 && g_dumpCount[buf[0]]++ < 3) {
+                    char line[1200];
+                    int at = sprintf_s(line, "report %02X len %lu:", buf[0], n);
+                    for (DWORD i = 0; i < min(n, (DWORD)110) && at < 1150; i++) at += sprintf_s(line + at, sizeof(line) - at, " %02X", buf[i]);
+                    g_dump += line;
+                    g_dump += "\r\n";
+                }
+                ReleaseSRWLockExclusive(&g_dumpLock);
+            }
+            if (got && n > 0 && p->bluetooth) TakeMic(p, buf.data(), n, micDecoder);
+            if (got && p->bluetooth && buf[0] >= 0x12 && buf[0] <= 0x19 && !(buf[1] & 0x80)) linkGot++;   // sound only
             if (got && n > 0 && ParseReport(p, buf.data(), n, next, &synced)) {
                 if (p->dongle) SetReady(p, synced);
                 if (synced) {
@@ -1761,7 +2372,8 @@ static DWORD WINAPI PadThread(LPVOID param) {
                     QueryPerformanceCounter(&count);
                     float dt = lastCount.QuadPart ? min(0.1f, (float)(count.QuadPart - lastCount.QuadPart) / freq.QuadPart) : 0;
                     lastCount = count;
-                    UpdateMotion(next, dt);
+                    UpdateMotion(next, dt, p->motionReset.exchange(false));
+                    if (next.imu) UpdateBatteryLife(p, batteryLife, next, now);
                     if (next.imu) {
                         int step = haveCounter ? ((next.counter - lastCounter) & 63) : 1;
                         linkSent += step ? step : 64;   // 0: a whole lap went missing
@@ -1808,7 +2420,9 @@ static DWORD WINAPI PadThread(LPVOID param) {
                     }
                     psHeld = psInCombo && (next.buttons & B_PS) && now - psDownAt < kPsDelayMs ? B_PS : 0;
                     UpdateTouchMouse(p, touchMouse, next, state.buttons, now, dt);
-                    DWORD touchHold = p->set[S_TPMOUSE] ? B_TOUCH : 0;     // the touchpad click is the mouse's
+                    if (!g_noInput) UpdateTouchVolume(p, touchVolume, next, state.buttons, now);
+                    // The touchpad click is the mouse's, or mutes (touchpad volume).
+                    DWORD touchHold = p->set[S_TPMOUSE] || p->set[S_TPVOLUME] ? B_TOUCH : 0;
 
                     if (memcmp(&next, &state, sizeof(state))) {
                         state = next;
@@ -2104,7 +2718,7 @@ static void FillGlow(gp::Graphics& g, float cx, float cy, float rx, float ry, gp
 
 enum ElemKind {
     E_TOGGLE, E_SEGMENT, E_BUTTON, E_PIN, E_THEME, E_THEME_ITEM, E_SLIDER, E_TAB, E_PAD3D,
-    E_SC_ROW, E_SC_ACTION, E_SC_ACTIONITEM, E_SC_DELETE, E_TP_TWO, E_TP_TWOITEM, E_TPBUTTON, E_SRC, E_SRCITEM,
+    E_SC_ROW, E_SC_ACTION, E_SC_ACTIONITEM, E_SC_DELETE, E_TP_TWO, E_TP_TWOITEM, E_TPBUTTON, E_SRC, E_SRCITEM, E_MICDST, E_MICDSTITEM,
 };
 enum ButtonId { BTN_STATUS, BTN_DISCONNECT, BTN_RUMBLE, BTN_SHORTCUTS, BTN_SC_ADD, BTN_SC_RESET, BTN_SC_DONE, BTN_SC_CANCEL };
 struct Elem { ElemKind kind; gp::RectF rc; int id; int sub; };
@@ -2116,6 +2730,16 @@ static gp::RectF g_twoAnchor;
 static bool g_srcMenuOpen;              // the "plays from" menu: Automatic, each playback device, Mirror
 static gp::RectF g_srcAnchor;
 static std::vector<audio::Device> g_srcDevices;
+static bool g_micMenuOpen;              // "mic goes to": Automatic, each playback device
+static gp::RectF g_micAnchor;
+
+static std::wstring MicDestLabel() {
+    std::wstring dest = micout::Dest();
+    if (dest.empty()) return L"Automatic";
+    for (const auto& d : g_srcDevices) if (d.id == dest) return d.name;
+    std::wstring playing = micout::PlayingTo();
+    return playing.empty() ? L"Not connected" : playing;
+}
 
 static std::wstring SourceLabel() {
     std::wstring source = audio::Source();
@@ -2202,7 +2826,7 @@ static const wchar_t* ToggleTitle(int setting, bool detail) {
 // A row with text on the left and a drop-down button on the right; returns the button.
 static gp::RectF DrawDropdownRow(gp::Graphics& g, gp::RectF r, const wchar_t* title, const wchar_t* detail, const wchar_t* value,
                                  ElemKind kind, bool open, bool live);
-static const int kSliderCount = (int)ARRAYSIZE(kSliders), kTuningSliders = 4;
+static const int kSliderCount = (int)ARRAYSIZE(kSliders), kTuningSliders = 3, SLIDER_RUMBLE = 3;
 static gp::RectF g_sliderTrack[kSliderCount];
 static int g_dragSlider = -1;
 
@@ -2239,7 +2863,9 @@ static void DrawSliderRow(gp::Graphics& g, gp::RectF r, int id, bool on) {
     gp::Color text = on ? p.text : WithAlpha(p.text, 110), sub = on ? p.subtext : WithAlpha(p.subtext, 110);
     Label(g, d.label, g_fonts.caption, text, gp::RectF(r.X + S(16), r.Y + S(8), r.Width - S(80), S(18)));
     wchar_t value[24];
+    Pad* selected = SelectedPad();
     if (d.setting == S_RAINBOW) swprintf_s(value, L"%.1f s a turn", 100.0 / v);
+    else if (d.setting == S_AUDIOVOL && selected && selected->audioMuted) wcscpy_s(value, L"Muted");
     else swprintf_s(value, L"%d%s", v, d.unit);
     Label(g, value, g_fonts.caption, sub, gp::RectF(r.X + r.Width - S(16) - S(90), r.Y + S(8), S(90), S(18)), gp::StringAlignmentFar);
     gp::RectF track(r.X + S(18), r.Y + S(35), r.Width - S(36), S(4));
@@ -2367,35 +2993,72 @@ static void DrawStick(gp::Graphics& g, const PadLayout& L, float cx, float cy, B
     g.DrawEllipse(&ring, x - cap * 0.68f, y - cap * 0.68f, cap * 1.36f, cap * 1.36f);
 }
 
-static void DrawTrigger(gp::Graphics& g, const PadLayout& L, float x, BYTE analog, bool l1, const wchar_t* l1Name, const wchar_t* l2Name) {
-    const Palette& p = Pal();
-    gp::RectF t2 = L.R(x, 34, 150, 62), t1 = L.R(x - 12, 100, 174, 44);
-    FillRound(g, t2, L.U(16), p.body);
-    if (analog) {
-        gp::GraphicsPath clip;
-        RoundPath(clip, t2, L.U(16));
-        gp::GraphicsState saved = g.Save();
-        g.SetClip(&clip, gp::CombineModeIntersect);
-        float hgt = t2.Height * analog / 255.0f;
-        gp::SolidBrush fill(kAccent);
-        g.FillRectangle(&fill, t2.X, t2.Y + t2.Height - hgt, t2.Width, hgt);
-        g.Restore(saved);
+// The body's outline in design units, with outward normals (made once).
+struct OutlinePoint { float u, v, nu, nv; };
+
+static const std::vector<OutlinePoint>& DesignOutline() {
+    static std::vector<OutlinePoint> pts;
+    if (!pts.empty()) return pts;
+    PadLayout unit{ 0, 0, 1 };
+    gp::GraphicsPath path;
+    PadBodyPath(path, unit);
+    path.Flatten(nullptr, 0.25f);
+    int n = path.GetPointCount();
+    std::vector<gp::PointF> f(n);
+    path.GetPathPoints(f.data(), n);
+    float area = 0;
+    for (int i = 0; i < n; i++) area += f[i].X * f[(i + 1) % n].Y - f[(i + 1) % n].X * f[i].Y;
+    for (int i = 0; i < n; i++) {
+        gp::PointF a = f[(i + n - 1) % n], b = f[(i + 1) % n];
+        float du = b.X - a.X, dv = b.Y - a.Y, len = max(1e-4f, sqrtf(du * du + dv * dv));
+        float nu = area > 0 ? dv / len : -dv / len, nv = area > 0 ? -du / len : du / len;
+        pts.push_back({ f[i].X, f[i].Y, nu, nv });
     }
-    StrokeRound(g, t2, L.U(16), p.bodyEdge, S(1));
-    Label(g, l2Name, g_fonts.tiny, analog > 128 ? kWhite : p.subtext, t2, gp::StringAlignmentCenter, gp::StringAlignmentCenter);
-    FillRound(g, t1, L.U(14), l1 ? kAccent : p.body);
-    StrokeRound(g, t1, L.U(14), p.bodyEdge, S(1));
-    Label(g, l1Name, g_fonts.tiny, l1 ? kWhite : p.subtext, gp::RectF(t1.X, t1.Y, t1.Width, t1.Height * 0.62f),
+    return pts;
+}
+
+// A shoulder button: a band along the top of the outline between u0 and u1, `offset` design
+// units out from it and `width` thick, with rounded ends. Returns its middle (for the label).
+static gp::PointF DrawShoulderBand(gp::Graphics& g, const PadLayout& L, float u0, float u1, float offset, float width,
+                                   gp::Color fill, gp::Color edge) {
+    std::vector<OutlinePoint> top;
+    for (const OutlinePoint& p : DesignOutline()) if (p.u >= u0 && p.u <= u1 && p.v < 260) top.push_back(p);
+    std::sort(top.begin(), top.end(), [](const OutlinePoint& a, const OutlinePoint& b) { return a.u < b.u; });
+    std::vector<gp::PointF> line;
+    for (const OutlinePoint& p : top) line.push_back(gp::PointF(L.X(p.u + p.nu * offset), L.Y(p.v + p.nv * offset)));
+    if (line.size() < 2) return gp::PointF();
+    gp::Pen border(edge, L.U(width) + S(2)), body(fill, L.U(width));
+    for (gp::Pen* pen : { &border, &body }) {
+        pen->SetStartCap(gp::LineCapRound);
+        pen->SetEndCap(gp::LineCapRound);
+        pen->SetLineJoin(gp::LineJoinRound);
+        g.DrawLines(pen, line.data(), (int)line.size());
+    }
+    return line[line.size() / 2];
+}
+
+// L1/R1 hug the controller's shoulders; L2/R2 sit just outside them, a little longer, and fill
+// in as they're pulled.
+static void DrawShoulders(gp::Graphics& g, const PadLayout& L, float u0, float u1, BYTE analog, bool bumper,
+                          const wchar_t* bumperName, const wchar_t* triggerName) {
+    const Palette& p = Pal();
+    float pull = analog / 255.0f;
+    gp::PointF t = DrawShoulderBand(g, L, u0 - 25, u1 + 25, 52, 34, Mix(p.body, kAccent, pull), p.bodyEdge);
+    gp::PointF b = DrawShoulderBand(g, L, u0, u1, 17, 24, bumper ? kAccent : p.body, p.bodyEdge);
+    Label(g, triggerName, g_fonts.tiny, pull > 0.5f ? kWhite : p.subtext, gp::RectF(t.X - S(20), t.Y - S(8), S(40), S(16)),
+          gp::StringAlignmentCenter, gp::StringAlignmentCenter);
+    Label(g, bumperName, g_fonts.tiny, bumper ? kWhite : p.subtext, gp::RectF(b.X - S(20), b.Y - S(8), S(40), S(16)),
           gp::StringAlignmentCenter, gp::StringAlignmentCenter);
 }
+static float g_split;                   // the touchpad's split line (left / right click), 0 hidden .. 1 shown
 
 static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::Color light, float opacity) {
     const Palette& p = Pal();
     gp::Color control = Mix(p.body, p.text, 0.10f);
     DWORD b = s.buttons;
 
-    DrawTrigger(g, L, 160, s.l2, (b & B_L1) != 0, L"L1", L"L2");
-    DrawTrigger(g, L, 690, s.r2, (b & B_R1) != 0, L"R1", L"R2");
+    DrawShoulders(g, L, 150, 330, s.l2, (b & B_L1) != 0, L"L1", L"L2");
+    DrawShoulders(g, L, 670, 850, s.r2, (b & B_R1) != 0, L"R1", L"R2");
 
     gp::GraphicsPath body;
     PadBodyPath(body, L);
@@ -2419,8 +3082,29 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
 
     // Touchpad with the fingers on it.
     gp::RectF pad = L.R(330, 142, 340, 176);
-    FillRound(g, pad, L.U(22), (b & B_TOUCH) ? Mix(control, kAccent, 0.55f) : control);
+    bool click = (b & B_TOUCH) != 0;
+    if (click && g_split > 0.5f) {          // split clicks: only the side being clicked lights up
+        int finger = s.touch[0] ? 0 : 1;
+        bool right = s.touch[finger] && s.tx[finger] >= 960;
+        FillRound(g, pad, L.U(22), control);
+        gp::GraphicsPath clip;
+        RoundPath(clip, pad, L.U(22));
+        gp::GraphicsState saved = g.Save();
+        g.SetClip(&clip, gp::CombineModeIntersect);
+        gp::SolidBrush half(Mix(control, kAccent, 0.55f));
+        g.FillRectangle(&half, right ? pad.X + pad.Width / 2 : pad.X, pad.Y, pad.Width / 2, pad.Height);
+        g.Restore(saved);
+    } else {
+        FillRound(g, pad, L.U(22), click ? Mix(control, kAccent, 0.55f) : control);
+    }
     StrokeRound(g, pad, L.U(22), p.bodyEdge, S(1));
+    if (g_split > 0.01f) {                  // the line grows from the middle when split clicks come on
+        float half = pad.Height * 0.42f * g_split, cx = pad.X + pad.Width / 2, cy = pad.Y + pad.Height / 2;
+        gp::Pen splitLine(WithAlpha(p.text, (int)(120 * g_split)), S(1.5));
+        splitLine.SetStartCap(gp::LineCapRound);
+        splitLine.SetEndCap(gp::LineCapRound);
+        g.DrawLine(&splitLine, cx, cy - half, cx, cy + half);
+    }
     for (int i = 0; i < 2; i++) {
         if (!s.touch[i]) continue;
         float x = pad.X + pad.Width * max(0.04f, min(0.96f, s.tx[i] / 1919.0f));
@@ -2478,14 +3162,18 @@ static const struct { DWORD bit; float u, v; int colour; int analog; } kGlowSpot
     { B_CROSS, 788, 313, GLOW_CROSS, 0 },       { B_SQUARE, 720, 245, GLOW_SQUARE, 0 },
     { B_UP, 212, 200, GLOW_CONTRAST, 0 },       { B_DOWN, 212, 288, GLOW_CONTRAST, 0 },
     { B_LEFT, 169, 245, GLOW_CONTRAST, 0 },     { B_RIGHT, 255, 245, GLOW_CONTRAST, 0 },
-    { B_L1, 247, 122, GLOW_CONTRAST, 0 },       { B_R1, 777, 122, GLOW_CONTRAST, 0 },
-    { 0, 235, 65, GLOW_ACCENT, 1 },             { 0, 765, 65, GLOW_ACCENT, 2 },          // L2, R2 by how far
+    { B_L1, 240, 104, GLOW_CONTRAST, 0 },       { B_R1, 760, 104, GLOW_CONTRAST, 0 },
+    { 0, 240, 68, GLOW_ACCENT, 1 },             { 0, 760, 68, GLOW_ACCENT, 2 },          // L2, R2 by how far
     { B_SHARE, 299, 173, GLOW_CONTRAST, 0 },    { B_OPTIONS, 701, 173, GLOW_CONTRAST, 0 },
     { B_PS, 500, 390, GLOW_ACCENT, 0 },         { B_TOUCH, 500, 230, GLOW_ACCENT, 0 },
     { B_L3, 352, 390, GLOW_CONTRAST, 0 },       { B_R3, 648, 390, GLOW_CONTRAST, 0 },
 };
 static float g_spotLevel[ARRAYSIZE(kGlowSpots)];
 static float g_fingerLevel[2], g_fingerU[2], g_fingerV[2];
+static float g_ringLevel;               // the whole outline glows: pulsing on a low battery,
+static int   g_ringStyle;               // breathing while charging (RING_*)
+enum { RING_LOW, RING_CHARGING, RING_FULL };
+static gp::Color g_ringColour = kBatteryYellow;
 
 static gp::Color GlowColour(int which) {
     switch (which) {
@@ -2499,7 +3187,25 @@ static gp::Color GlowColour(int which) {
 }
 
 // Eases each light towards its button (quick in, slow out) and follows the fingers.
+static bool g_touchSplit, g_touchRight;    // split clicks on, and which side the click is on
+
 static void UpdateAmbient(const PadState& s, bool live) {
+    g_touchSplit = g_split > 0.5f;
+    if (s.buttons & B_TOUCH) {
+        int finger = s.touch[0] ? 0 : 1;
+        g_touchRight = s.touch[finger] && s.tx[finger] >= 960;
+    }
+    bool known = live && s.battery >= 0;
+    bool charging = known && s.charging, low = known && !s.charging && s.battery < kBatteryLowLevel;
+    if (charging) {                     // breathing in the battery's colour; steady green once full
+        g_ringStyle = s.battery >= 100 ? RING_FULL : RING_CHARGING;
+        g_ringColour = BatteryColor(s.battery);
+    } else if (low) {
+        g_ringStyle = RING_LOW;
+        g_ringColour = BatteryColor(s.battery);
+    }
+    g_ringLevel += ((charging || low ? 1.0f : 0.0f) - g_ringLevel) * 0.08f;
+    if (g_ringLevel < 0.01f) g_ringLevel = 0;
     for (int i = 0; i < (int)ARRAYSIZE(kGlowSpots); i++) {
         const auto& spot = kGlowSpots[i];
         float target = !live ? 0 : spot.analog == 1 ? s.l2 / 255.0f : spot.analog == 2 ? s.r2 / 255.0f
@@ -2525,7 +3231,7 @@ static void UpdateAmbient(const PadState& s, bool live) {
 
 static bool AmbientActive() {
     for (float level : g_spotLevel) if (level > 0) return true;
-    return g_fingerLevel[0] > 0 || g_fingerLevel[1] > 0;
+    return g_fingerLevel[0] > 0 || g_fingerLevel[1] > 0 || g_ringLevel > 0;
 }
 
 struct AmbientField {
@@ -2577,7 +3283,9 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h) {
     for (int i = 0; i < (int)ARRAYSIZE(kGlowSpots); i++) {
         if (!g_spotLevel[i]) continue;
         gp::Color c = GlowColour(kGlowSpots[i].colour);
-        sources[count++] = { kGlowSpots[i].u, kGlowSpots[i].v, g_spotLevel[i], (float)c.GetR(), (float)c.GetG(), (float)c.GetB() };
+        float u = kGlowSpots[i].u;
+        if (kGlowSpots[i].bit == B_TOUCH && g_touchSplit) u = g_touchRight ? 585.0f : 415.0f;  // just the clicked side
+        sources[count++] = { u, kGlowSpots[i].v, g_spotLevel[i], (float)c.GetR(), (float)c.GetG(), (float)c.GetB() };
     }
     for (int i = 0; i < 2; i++) {
         if (!g_fingerLevel[i]) continue;
@@ -2591,6 +3299,13 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h) {
     // Each source lights cells by their own distance from it (smooth everywhere), and the
     // outline's fade keeps the light hugging the edge.
     float sigma = L.U(kAmbientSpread), twoSigma2 = 2 * sigma * sigma;
+    float seconds = (GetTickCount64() % 1000000) / 1000.0f, ring;
+    if (g_ringStyle == RING_CHARGING)       // a slow breath, about every 3 s
+        ring = g_ringLevel * (0.08f + 0.62f * (0.5f - 0.5f * cosf(seconds * 2 * kPi / 3.0f)));
+    else if (g_ringStyle == RING_FULL)
+        ring = g_ringLevel * 0.35f;
+    else                                    // low battery: a quicker pulse
+        ring = g_ringLevel * (0.55f + 0.25f * sinf(seconds * 2.2f));
     for (int i = 0; i < count; i++) { sources[i].u = L.X(sources[i].u); sources[i].v = L.Y(sources[i].v); }
     for (int row = 0; row < F.rows; row++) {
         float py = F.oy + row * kAmbientStep + 0.5f;
@@ -2603,6 +3318,9 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h) {
                 float dx = px - sources[i].u, dy = py - sources[i].v;
                 float weight = sources[i].strength * expf(-(dx * dx + dy * dy) / twoSigma2);
                 sum += weight; r += weight * sources[i].r; gr += weight * sources[i].gr; b += weight * sources[i].b;
+            }
+            if (ring > 0) {
+                sum += ring; r += ring * g_ringColour.GetR(); gr += ring * g_ringColour.GetG(); b += ring * g_ringColour.GetB();
             }
             if (sum < 0.004f) continue;
             float a = min(1.0f, sum) * F.fade[k] * 0.7f;
@@ -2887,7 +3605,7 @@ static void DrawFaces(gp::Graphics& g, std::vector<Face>& faces) {
 }
 
 // The view: a base tilt, then the user's spin, then the pad's own motion.
-static const float kViewTilt = 1.95f;       // ~112 degrees: seen from above the back, light bar showing
+static const float kViewTilt = 0.38f;       // ~22 degrees: seen from where you hold it, as the real one
 static float g_viewYaw, g_viewPitch, g_spinYaw, g_spinPitch;
 static bool  g_dragPad, g_viewReset;
 static POINT g_dragLast;
@@ -2902,9 +3620,15 @@ static gp::PointF DrawPad3D(gp::Graphics& g, gp::RectF area, const PadState& s, 
     sc.dist = 2600;
     sc.light = Normal(V3{ -0.35f, 0.75f, 0.6f });
     M3 device = RotY(0);
-    if (motion) {
-        V3 up = Normal(V3{ s.up[0], s.up[1], s.up[2] });
-        device = RotY(s.yaw) * Align(up, V3{ 0, 1, 0 });
+    if (motion) {                           // the raw orientation, and moved by its acceleration
+        float w = s.q[0], x = s.q[1], y = s.q[2], z = s.q[3];
+        device = { 1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                   2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                   2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y) };
+        auto clamp = [](float v) { return max(-1.5f, min(1.5f, v)); };
+        sc.cx += clamp(s.lin[0]) * S(40);       // sideways: left and right
+        sc.cy -= clamp(s.lin[1]) * S(30);       // up and down
+        sc.scale *= 1 + 0.15f * clamp(s.lin[1] + s.lin[2]);    // up, or towards you: closer, bigger
     }
     sc.r = RotX(kViewTilt + g_viewPitch) * RotY(g_viewYaw) * device;
 
@@ -2931,34 +3655,6 @@ static gp::PointF DrawPad3D(gp::Graphics& g, gp::RectF area, const PadState& s, 
         g.FillRectangle(&wash, area);
     }
     return bar;
-}
-
-// The small 3D preview in the corner: tilt and turn from the motion sensors, and the force
-// (in g) the accelerometer feels. Drag it to spin; double-click to straighten it.
-static void DrawMotionCard(gp::Graphics& g, gp::RectF card, const PadState& s, gp::Color light, Pad* pad, bool hover) {
-    const Palette& p = Pal();
-    FillRound(g, card, S(12), hover ? Mix(WithAlpha(p.card, 255), p.hover, 0.5f) : p.card);
-    Label(g, L"MOTION", g_fonts.tiny, p.subtext, gp::RectF(card.X + S(10), card.Y + S(5), S(80), S(14)));
-    bool motion = pad && pad->set[S_MOTION] && s.imu;
-    gp::Graphics* canvas = g_canvasGraphics;   // keep the glows inside the card (the fast path ignores clipping)
-    g_canvasGraphics = nullptr;
-    gp::GraphicsState saved = g.Save();
-    gp::GraphicsPath clip;
-    RoundPath(clip, card, S(12));
-    g.SetClip(&clip, gp::CombineModeIntersect);
-    DrawPad3D(g, gp::RectF(card.X + S(6), card.Y + S(14), card.Width - S(12), card.Height - S(36)), s, light, motion, 1);
-    g.Restore(saved);
-    g_canvasGraphics = canvas;
-    wchar_t text[96];
-    if (motion) {
-        float force = sqrtf((float)s.accel[0] * s.accel[0] + (float)s.accel[1] * s.accel[1] + (float)s.accel[2] * s.accel[2]) / 8192;
-        float tilt = acosf(max(-1.0f, min(1.0f, s.up[1]))) * 180 / kPi;
-        swprintf_s(text, L"%.2f g   \x00B7   tilt %.0f\x00B0   \x00B7   turn %+.0f\x00B0", force, tilt, s.yaw * 180 / kPi);
-    } else {
-        wcscpy_s(text, !pad ? L"No controller" : !s.imu ? L"No motion data yet" : L"3D motion is off");
-    }
-    Label(g, text, g_fonts.caption, p.subtext, gp::RectF(card.X + S(6), card.Y + card.Height - S(22), card.Width - S(12), S(18)),
-          gp::StringAlignmentCenter);
 }
 
 static void StepView(float dt) {
@@ -2994,6 +3690,21 @@ static const wchar_t kGlyphPin[] = L"\xE718", kGlyphPinned[] = L"\xE840", kGlyph
                      kGlyphBluetooth[] = L"\xE702", kGlyphUsb[] = L"\xE88E", kGlyphPad[] = L"\xE7FC",
                      kGlyphDelete[] = L"\xE74D", kGlyphRecord[] = L"\xE7C8", kGlyphMouse[] = L"\xE962";
 static const wchar_t* const kThemeNames[] = { L"Automatic", L"Light", L"Dark" };
+
+// Under the battery: "Charging", or how long it should last ("Roughly" until it has watched
+// this controller drain for a while).
+static std::wstring BatteryNote(Pad* pad, const PadState& s) {
+    if (!pad || s.battery < 0) return L"";
+    if (s.charging) return L"Charging";
+    int minutes = pad->minutesLeft;
+    if (minutes < 0) return L"";
+    const wchar_t* how = pad->estimateSure ? L"About" : L"Roughly";
+    wchar_t text[64];
+    if (minutes < 60) swprintf_s(text, L"%s %d minutes left", how, max(5, (minutes + 2) / 5 * 5));
+    else if (minutes < 90) swprintf_s(text, L"%s 1 hour left", how);
+    else swprintf_s(text, L"%s %.0f hours left", how, minutes / 60.0);
+    return text;
+}
 
 static void DrawBattery(gp::Graphics& g, float centerX, float top, int level, const wchar_t* note) {
     const Palette& p = Pal();
@@ -3371,7 +4082,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
         g_mapButtons = s.buttons;
         for (const ButtonMap& m : kButtonMap) {
             if (!(pressed & m.pad) || g_recording) continue;
-            bool unmapped = (m.pad == B_PS && !pad->set[S_PSGUIDE]) || (m.pad == B_TOUCH && !pad->set[S_TOUCHBACK]);
+            bool unmapped = m.pad == B_TOUCH && !pad->set[S_TOUCHBACK];
             g_mapText = std::wstring(m.from) + L"  \x2192  " + (unmapped ? L"nothing" : m.to);
             g_mapTick = now;
         }
@@ -3383,23 +4094,20 @@ static void PaintWindow(HWND hwnd, HDC target) {
         float sideW = S(kSideW);
         float lx = m, rx = w - m - sideW;
         float cxl = lx + sideW + m, cxr = rx - m;
-        float bandH = S(128);               // under the controller: values, and the motion card in the corner
+        float bandH = S(150);               // under the controller: the motion preview, then the values
         gp::RectF centre(cxl, top, cxr - cxl, bottom - top - bandH);
         PadLayout layout = LayoutPad(centre);
-        gp::RectF preview(cxr - S(184), centre.Y + centre.Height + S(4), S(184), bandH - S(8));
+        gp::RectF preview(layout.X(500) - S(125), layout.Y(612), S(250), S(112));
         int previewElem = AddElem(E_PAD3D, preview, 0);
 
-        // The light bar's colour glows behind the controller; rumble makes it swell.
+        // No glow behind the controller, except the ambilight: pressed buttons, fingers on the
+        // touchpad, and a pulsing ring when the battery runs low.
         g.Clear(p.bg);
         gp::Color light = pad ? PadLight(pad, s.battery) : gp::Color(0, 0, 0, 0);
         bool emulating = pad && (pad->emulating || pad->fake) && g_enabled;
-        if (pad && light.GetA()) {
-            float rumble = max(pad->rumbleStrong.load(), pad->rumbleWeak.load()) / 255.0f;
-            if (now < pad->testUntil) rumble = 0.8f;
-            float pulse = 1 + 0.10f * rumble * sinf(now / 28.0f);
-            int alpha = (int)((g_dark ? 90 : 70) * (emulating ? 1.0f : 0.45f) + 70 * rumble);
-            FillGlow(g, layout.X(500), layout.Y(330), layout.U(700) * pulse, layout.U(520) * pulse, WithAlpha(light, alpha));
-        }
+        float splitGoal = live && pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
+        g_split += (splitGoal - g_split) * 0.18f;
+        if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
         UpdateAmbient(s, live);
         DrawAmbient(g, layout, w, h);
 
@@ -3431,25 +4139,20 @@ static void PaintWindow(HWND hwnd, HDC target) {
         Label(g, title, g_fonts.title, p.text, gp::RectF(m + S(26), headerY + S(14), S(330), S(28)));
         Label(g, status, g_fonts.caption, p.subtext, gp::RectF(m, headerY + S(42), S(400), S(20)));
         float batteryX = pad && pad->bluetooth ? w / 2 - S(50) : w / 2;     // the signal goes beside it
-        DrawBattery(g, batteryX, headerY + S(22), pad ? s.battery : -1, pad && s.charging ? L"Charging" : L"");
+        DrawBattery(g, batteryX, headerY + S(22), pad ? s.battery : -1, BatteryNote(pad, s).c_str());
         DrawSignal(g, w / 2 + S(22), headerY + S(25), pad);
         gp::RectF themeBtn(w - m - S(124), headerY + S(20), S(124), S(36));
         gp::RectF pinBtn(themeBtn.X - S(10) - S(36), headerY + S(20), S(36), S(36));
         DrawIconButton(g, pinBtn, E_PIN, g_onTop ? kGlyphPinned : kGlyphPin, nullptr, g_onTop);
-        gp::RectF mouseBtn(pinBtn.X - S(10) - S(36), headerY + S(20), S(36), S(36));     // touchpad mouse on / off
-        DrawIconButton(g, mouseBtn, E_TPBUTTON, kGlyphMouse, nullptr, pad && pad->set[S_TPMOUSE]);
-        gp::RectF master(mouseBtn.X - S(14) - S(140), headerY + S(20), S(140), S(36));
-        if (Hovered(AddElem(E_TOGGLE, master, kSlotEnabled))) FillRound(g, master, S(10), p.hover);
-        Label(g, L"Emulation", g_fonts.body, p.text, gp::RectF(master.X + S(12), master.Y, S(76), master.Height));
-        DrawSwitch(g, gp::RectF(master.X + master.Width - S(10) - S(kSwitchW), master.Y + (master.Height - S(kSwitchH)) / 2,
-                                S(kSwitchW), S(kSwitchH)), g_knob[kSlotEnabled]);
+
         const wchar_t* themeGlyph = g_themeMode == THEME_LIGHT ? kGlyphSun : g_themeMode == THEME_DARK ? kGlyphMoon
                                     : (g_dark ? kGlyphMoon : kGlyphSun);
         DrawIconButton(g, themeBtn, E_THEME, themeGlyph, g_themeMode == THEME_AUTO ? L"Auto" : kThemeNames[g_themeMode], g_themeOpen);
 
         // Columns, centred vertically on the taller (right) one.
         float rightH = S(24) + S(kSliderRowH) * kTuningSliders + S(20) + S(24) + S(34) + S(10) + S(kSliderRowH) * 3;
-        float y0 = top + max(0.0f, (bottom - top - rightH) / 2);
+        float leftH = S(34) + S(10) + S(kRowH) * kEmulationCount + S(kSliderRowH);    // the Emulation tab, the tallest
+        float y0 = top + max(0.0f, (bottom - top - max(leftH, rightH)) / 2);
 
         // Left column: Emulation, Touchpad and Sound, one at a time.
         static const wchar_t* const leftTabs[] = { L"Emulation", L"Touchpad", L"Sound" };
@@ -3458,20 +4161,21 @@ static void PaintWindow(HWND hwnd, HDC target) {
         gp::Pen line(p.line, S(1));
         auto separator = [&](float at) { g.DrawLine(&line, lx + S(16), at, lx + sideW, at); };
         if (g_leftTab == 0) {
-            FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * kEmulationCount), S(12), p.card);
+            FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * kEmulationCount + S(kSliderRowH)), S(12), p.card);
             for (int i = 0; i < kEmulationCount; i++) {
                 int setting = kEmulationToggles[i];
-                float ry = y + S(kRowH) * i;
-                if (i) separator(ry);
-                bool usable = live && (setting != S_HIDE || hidhide::g_ready) && (setting != S_IDLE || pad->bluetooth)
-                              && (setting != S_TOUCHBACK || !pad->set[S_TPMOUSE]);
+                if (i) separator(y);
+                bool usable = live && (setting != S_HIDE || hidhide::g_ready) && (setting != S_IDLE || pad->bluetooth);
                 const wchar_t* detail = setting == S_HIDE && !hidhide::g_ready ? L"Needs the HidHide driver"
                                       : setting == S_MOTION && pad && !s.imu ? L"Waiting for motion data"
-                                      : setting == S_TOUCHBACK && pad && pad->set[S_TPMOUSE] ? L"The touchpad is a mouse now"
                                       : ToggleTitle(setting, true);
-                DrawToggleRow(g, gp::RectF(lx, ry, sideW, S(kRowH)), setting, ToggleTitle(setting, false), detail, usable);
-            }
-        } else if (g_leftTab == 1) {
+                DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), setting, ToggleTitle(setting, false), detail, usable);
+                y += S(kRowH);
+                if (setting == S_RUMBLE) {          // its strength, right under it
+                    DrawSliderRow(g, gp::RectF(lx, y - S(8), sideW, S(kSliderRowH)), SLIDER_RUMBLE, live && pad->set[S_RUMBLE]);
+                    y += S(kSliderRowH) - S(8);
+                }
+            }        } else if (g_leftTab == 1) {
             bool mouse = live && pad->set[S_TPMOUSE];
             FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * 5 + S(kSliderRowH)), S(12), p.card);
             DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPMOUSE, ToggleTitle(S_TPMOUSE, false), ToggleTitle(S_TPMOUSE, true), live);
@@ -3495,7 +4199,8 @@ static void PaintWindow(HWND hwnd, HDC target) {
             if (!mouse) g_twoMenuOpen = false;
         } else {
             bool bt = live && pad->bluetooth, on = bt && pad->set[S_AUDIO];
-            FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * 3 + S(kSliderRowH)), S(12), p.card);
+            bool mouse = live && pad->set[S_TPMOUSE];
+            FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * 6 + S(kSliderRowH)), S(12), p.card);
             DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_AUDIO, ToggleTitle(S_AUDIO, false),
                           live && !pad->bluetooth ? L"Not needed on USB" : ToggleTitle(S_AUDIO, true), bt);
             y += S(kRowH); separator(y);
@@ -3508,7 +4213,19 @@ static void PaintWindow(HWND hwnd, HDC target) {
                           outputs, 2, SettingValue(S_AUDIOOUT) ? 1 : 0, bt);
             y += S(kRowH); separator(y);
             DrawSliderRow(g, gp::RectF(lx, y, sideW, S(kSliderRowH)), SLIDER_AUDIOVOL, bt);
-            y += S(kSliderRowH) + S(8);
+            y += S(kSliderRowH); separator(y);
+            DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPVOLUME, ToggleTitle(S_TPVOLUME, false),
+                          mouse ? L"Needs the touchpad mouse off" : ToggleTitle(S_TPVOLUME, true), live && !mouse);
+            y += S(kRowH); separator(y);
+            const wchar_t* micDetail = !bt ? (live ? L"On USB it's a Windows mic already" : ToggleTitle(S_MIC, true))
+                                     : s.mic ? (pad->set[S_MIC] ? L"Plugged in, on" : L"Plugged in")
+                                     : L"No headset mic plugged in";
+            DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_MIC, ToggleTitle(S_MIC, false), micDetail, bt);
+            y += S(kRowH); separator(y);
+            std::wstring micTo = MicDestLabel();
+            g_micAnchor = DrawDropdownRow(g, gp::RectF(lx, y, sideW, S(kRowH)), L"Mic goes to", L"A playback device",
+                                          micTo.c_str(), E_MICDST, g_micMenuOpen, bt && pad->set[S_MIC]);
+            y += S(kRowH) + S(8);
             wchar_t note[160];
             if (live && !pad->bluetooth) wcscpy_s(note, L"On USB the controller is its own sound\ndevice: pick it in Windows' sound settings.");
             else if (!on) wcscpy_s(note, L"Experimental. Apps that play to the chosen\ndevice play on the controller.");
@@ -3518,6 +4235,11 @@ static void PaintWindow(HWND hwnd, HDC target) {
             else if (!pad->audioOn) wcscpy_s(note, L"Starting\x2026");
             else swprintf_s(note, L"Playing \x00B7 %u reports sent%s", pad->audioSent.load(),
                             pad->audioFailed ? L", some failed" : L"");
+            if (bt && pad->set[S_MIC]) {        // the mic's state matters more once it's on
+                if (micout::g_error == audio::kNoDevice) wcscpy_s(note, L"Mic: install VB-Audio Hi-Fi Cable, or pick\na device under \"Mic goes to\".");
+                else if (micout::g_error) swprintf_s(note, L"Mic: couldn't open the device (0x%08lX).", (unsigned long)micout::g_error.load());
+                else if (pad->micOn) swprintf_s(note, L"Mic on \x00B7 %u frames%s", pad->micFrames.load(), pad->micBad ? L", some unreadable" : L"");
+            }
             gp::StringFormat fmt;
             gp::SolidBrush brush(p.subtext);
             g.DrawString(note, -1, g_fonts.caption, gp::RectF(lx + S(4), y, sideW, S(40)), &fmt, &brush);
@@ -3556,26 +4278,24 @@ static void PaintWindow(HWND hwnd, HDC target) {
         y += S(kSliderRowH);
         g.DrawLine(&line, rx + S(16), y, rx + sideW, y);
         DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 6, live && mode == LIGHT_RAINBOW);
-
         // The controller; under it the raw values and the last mapping, and the motion card.
         DrawPad(g, layout, s, light, live ? (emulating ? 1.0f : 0.75f) : 0.4f);
-        DrawMotionCard(g, preview, s, light, pad, Hovered(previewElem));
-        float infoX = cxl, infoW = preview.X - S(12) - cxl, ty = preview.Y + S(12);
+        if (live) DrawPad3D(g, preview, s, light, pad->set[S_MOTION] && s.imu, 1);   // drag to spin, double-click to level
+        (void)previewElem;
+        float infoX = cxl, infoW = cxr - cxl, ty = preview.Y + preview.Height + S(4);
         if (pad) {
             wchar_t info[160];
-            swprintf_s(info, L"L  %+.2f, %+.2f   \x00B7   R  %+.2f, %+.2f", (s.lx - 127.5) / 127.5, -(s.ly - 127.5) / 127.5,
-                       (s.rx - 127.5) / 127.5, -(s.ry - 127.5) / 127.5);
+            swprintf_s(info, L"L  %+.2f, %+.2f   \x00B7   R  %+.2f, %+.2f   \x00B7   L2  %d   \x00B7   R2  %d",
+                       (s.lx - 127.5) / 127.5, -(s.ly - 127.5) / 127.5, (s.rx - 127.5) / 127.5, -(s.ry - 127.5) / 127.5, s.l2, s.r2);
             Label(g, info, g_fonts.caption, p.subtext, gp::RectF(infoX, ty, infoW, S(18)), gp::StringAlignmentCenter);
-            swprintf_s(info, L"L2  %d   \x00B7   R2  %d", s.l2, s.r2);
-            Label(g, info, g_fonts.caption, p.subtext, gp::RectF(infoX, ty + S(18), infoW, S(18)), gp::StringAlignmentCenter);
             if (!g_mapText.empty() && now - g_mapTick < kMapShowMs) {
                 int alpha = (int)min(255.0, (kMapShowMs - (now - g_mapTick)) * 255.0 / 400);
-                Label(g, g_mapText.c_str(), g_fonts.big, WithAlpha(p.text, alpha), gp::RectF(infoX, ty + S(46), infoW, S(26)),
+                Label(g, g_mapText.c_str(), g_fonts.big, WithAlpha(p.text, alpha), gp::RectF(infoX, ty + S(20), infoW, S(26)),
                       gp::StringAlignmentCenter);
             }
         } else {
             Label(g, L"Hold PS + Share to pair over Bluetooth, or plug in a cable", g_fonts.caption, p.subtext,
-                  gp::RectF(infoX, ty + S(18), infoW, S(18)), gp::StringAlignmentCenter);
+                  gp::RectF(infoX, preview.Y + S(40), infoW, S(18)), gp::StringAlignmentCenter);
         }
 
         // Footer card: start with Windows, then the app buttons on the right.
@@ -3599,6 +4319,18 @@ static void PaintWindow(HWND hwnd, HDC target) {
         }
         if (g_twoMenuOpen && g_leftTab == 1)
             DrawMenu(g, g_twoAnchor, S(170), h, E_TP_TWOITEM, 0, kTwoFingerNames, TWO_COUNT, SettingValue(S_TPTWO));
+        if (g_micMenuOpen && g_leftTab == 2) {
+            std::vector<const wchar_t*> names;
+            names.push_back(L"Automatic (Hi-Fi Cable Input)");
+            int selected = 0;
+            std::wstring dest = micout::Dest();
+            for (size_t i = 0; i < g_srcDevices.size(); i++) {
+                names.push_back(g_srcDevices[i].name.c_str());
+                if (g_srcDevices[i].id == dest) selected = (int)i + 1;
+            }
+            DrawMenu(g, gp::RectF(lx, g_micAnchor.Y, S(320), g_micAnchor.Height), S(320), h, E_MICDSTITEM, 0, names.data(),
+                     (int)names.size(), selected);
+        }
         if (g_srcMenuOpen && g_leftTab == 2) {
             std::vector<const wchar_t*> names;
             names.push_back(L"Automatic (DualShock or CABLE Input)");
@@ -3684,13 +4416,20 @@ static std::wstring StatusText() {
                    p->emulating ? L"emulating" : L"not emulating", p->serial.c_str(), p->inLen, p->outLen);
         text += line;
         if (s.imu) {
-            swprintf_s(line, L"     motion: accel %d %d %d, gyro %d %d %d, up %.2f %.2f %.2f, yaw %.2f\n", s.accel[0], s.accel[1],
-                       s.accel[2], s.gyro[0], s.gyro[1], s.gyro[2], s.up[0], s.up[1], s.up[2], s.yaw);
+            swprintf_s(line, L"     motion: accel %d %d %d, gyro %d %d %d, moving %+.2f %+.2f %+.2f g\n", s.accel[0], s.accel[1],
+                       s.accel[2], s.gyro[0], s.gyro[1], s.gyro[2], s.lin[0], s.lin[1], s.lin[2]);
             text += line;
         }
-        swprintf_s(line, L"     link: %d%% of reports arrive, %d reports/s (interval setting %d)\n", p->link.load(),
-                   p->reportRate.load(), p->poll.load());
+            swprintf_s(line, L"     link: %d%% of reports arrive, %d reports/s (interval setting %d), %u corrupted dropped\n", p->link.load(),
+                   p->reportRate.load(), p->poll.load(), p->crcBad.load());
         text += line;
+        if (p->set[S_MIC]) {
+            swprintf_s(line, L"     mic: %s, headset mic %s, %u frames, %u unreadable, %u echo skipped, target 0x%02X, output %s (0x%08lX)\n",
+                       p->micOn ? L"on" : L"off", s.mic ? L"plugged in" : L"not plugged in", p->micFrames.load(),
+                       p->micBad.load(), p->micEcho.load(), p->micTarget.load() & 0xFF,
+                       micout::g_running ? L"running" : L"stopped", (unsigned long)micout::g_error.load());
+            text += line;
+        }
         if (p->set[S_AUDIO]) {
             swprintf_s(line, L"     sound: %s, %u reports sent, %u failed, %u dropouts, capture %s (0x%08lX)\n",
                        p->audioOn ? L"on" : L"off", p->audioSent.load(), p->audioFailed.load(), p->audioDropouts.load(),
@@ -3733,7 +4472,7 @@ static void Activate(HWND hwnd, const Elem& e) {
         else if (pad) pad->set[e.id] = !pad->set[e.id];
         break;
     case E_SEGMENT:
-        if (e.id == SEG_LEFT_TAB) { g_leftTab = e.sub; g_twoMenuOpen = g_srcMenuOpen = false; return; }
+        if (e.id == SEG_LEFT_TAB) { g_leftTab = e.sub; g_twoMenuOpen = g_srcMenuOpen = g_micMenuOpen = false; return; }
         if (!pad) return;
         if (e.id == SEG_AUDIO_OUT) { pad->set[S_AUDIOOUT] = e.sub; break; }
         if (e.sub == LIGHT_RAINBOW && pad->set[S_LIGHTMODE] != LIGHT_RAINBOW) pad->lastLight = pad->set[S_LIGHTMODE].load();
@@ -3805,6 +4544,14 @@ static void Activate(HWND hwnd, const Elem& e) {
         g_srcMenuOpen = !g_srcMenuOpen;
         if (g_srcMenuOpen) g_srcDevices = audio::Devices();
         return;
+    case E_MICDST:
+        g_micMenuOpen = !g_micMenuOpen;
+        if (g_micMenuOpen) g_srcDevices = audio::Devices();
+        return;
+    case E_MICDSTITEM:
+        g_micMenuOpen = false;
+        micout::SetDest(e.sub == 0 || e.sub > (int)g_srcDevices.size() ? L"" : g_srcDevices[e.sub - 1].id);
+        return;
     case E_SRCITEM:
         g_srcMenuOpen = false;
         if (e.sub == 0) audio::SetSource(L"");
@@ -3849,6 +4596,8 @@ static bool Animating() {
     if (pad != g_paintedPad || !pad) return true;       // searching dots
     if (pad->seq != g_paintedSeq) return true;
     if (g_dragPad || g_viewReset || g_spinYaw || g_spinPitch || g_viewPitch || g_recording) return true;
+    float splitGoal = pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
+    if (g_split != splitGoal) return true;
     int mode = pad->set[S_LIGHTMODE];
     if (mode == LIGHT_RAINBOW || mode == LIGHT_CHROMA) return true;
     if (AmbientActive() || (g_leftTab == 2 && pad->audioOn)) return true;
@@ -3925,6 +4674,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (HitKind(HitTest(lp)) == E_PAD3D && HitTest(lp) >= 0 && !g_panelOpen) {
             g_viewReset = true;
             g_spinYaw = g_spinPitch = 0;
+            if (Pad* pad = SelectedPad()) pad->motionReset = true;     // and level the controller again
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -3971,6 +4721,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_twoMenuOpen = false;
             return 0;
         }
+        if (g_micMenuOpen && (!same || (g_elems[hit].kind != E_MICDSTITEM && g_elems[hit].kind != E_MICDST))) {
+            g_micMenuOpen = false;
+            return 0;
+        }
         if (g_srcMenuOpen && (!same || (g_elems[hit].kind != E_SRCITEM && g_elems[hit].kind != E_SRC))) {
             g_srcMenuOpen = false;
             return 0;
@@ -3988,6 +4742,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (g_actionMenuRow >= 0) g_actionMenuRow = -1;
             else if (g_twoMenuOpen) g_twoMenuOpen = false;
             else if (g_srcMenuOpen) g_srcMenuOpen = false;
+            else if (g_micMenuOpen) g_micMenuOpen = false;
             else if (g_recording) StopRecording();
             else if (g_panelOpen) ClosePanel();
             else PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -4070,6 +4825,9 @@ static void Refresh() {
     bool sound = false;                     // capture the PC's sound while a controller plays it
     for (Pad* p : g_pads) sound = sound || (p->ready && p->bluetooth && !p->fake && p->set[S_AUDIO]);
     audio::Want(sound && !g_exiting);
+    bool mic = false;                       // play a controller's mic while one has it on
+    for (Pad* p : g_pads) mic = mic || (p->ready && p->bluetooth && !p->fake && p->set[S_MIC]);
+    micout::Want(mic && !g_exiting);
     UpdateTray(g_tray, NIM_MODIFY);
     InvalidateRect(g_window, nullptr, FALSE);
 }
@@ -4077,7 +4835,7 @@ static void Refresh() {
 static void ShowTrayMenu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | MF_DEFAULT, ID_MENU_OPEN, L"Open DS4-Native");
-    AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), ID_MENU_ENABLED, L"Emulation");
+
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_MENU_EXIT, L"Exit");
     POINT pt;
@@ -4102,6 +4860,16 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         Refresh();
         return 0;
+    case WM_VOLUME: {
+        wchar_t text[48];
+        const wchar_t* what = (lp & 2) ? L"Controller volume" : L"Volume";
+        if (lp & 1) swprintf_s(text, L"%s  muted", what);
+        else swprintf_s(text, L"%s  %d%%", what, (int)wp);
+        g_mapText = text;
+        g_mapTick = GetTickCount64();
+        InvalidateRect(g_window, nullptr, FALSE);
+        return 0;
+    }
     case WM_SHORTCUT:
         g_mapText = ComboText((DWORD)lp) + L"  \x2192  " + kActionNames[min((int)wp, A_COUNT - 1)];
         g_mapTick = GetTickCount64();
@@ -4175,10 +4943,13 @@ static void AddDemoPad() {
     p->state.lx = 220; p->state.ly = 60; p->state.r2 = 170;
     p->state.touch[0] = true; p->state.tx[0] = 600; p->state.ty[0] = 400;
     p->state.battery = 62;
+    wchar_t level[16];
+    if (GetEnvironmentVariableW(L"DS4NATIVE_BATTERY", level, 16)) p->state.battery = _wtoi(level);
     p->state.imu = true;
-    V3 up = Normal(V3{ 0.22f, 1, -0.18f });
-    p->state.up[0] = up.x; p->state.up[1] = up.y; p->state.up[2] = up.z;
-    p->state.yaw = 0.35f;
+    float dq[4] = { 0.96f, 0.12f, 0.18f, -0.1f }, dn = sqrtf(dq[0] * dq[0] + dq[1] * dq[1] + dq[2] * dq[2] + dq[3] * dq[3]);
+    for (int i = 0; i < 4; i++) p->state.q[i] = dq[i] / dn;
+    p->state.oriented = true;
+    p->minutesLeft = 260;
     p->link = 96;
     p->player = 0;
     p->ready = true;
@@ -4226,6 +4997,11 @@ static void SelfTestFinish() {
     wchar_t timing[128];
     swprintf_s(timing, L"\nPaint: %.1f ms a frame (3D model %.1f ms, big glow %.1f ms)\n", frame, model, glow);
     std::wstring status = StatusText() + timing;
+    if (g_testMic) {
+        AcquireSRWLockShared(&g_dumpLock);
+        status += L"\r\n" + std::wstring(g_dump.begin(), g_dump.end());
+        ReleaseSRWLockShared(&g_dumpLock);
+    }
     HANDLE file = CreateFileW((g_selfTest + L"\\status.txt").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         DWORD written;
@@ -4240,6 +5016,33 @@ static HANDLE g_single;     // single-instance mutex
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     if (!wcsncmp(cmdLine, L"/chroma ", 8)) return ChromaHelperMain(cmdLine + 8);
+    if (!wcsncmp(cmdLine, L"/sbctest ", 9)) {    // testing: encode a tone, decode it, compare
+        const int kFrames = 64, n = kFrames * 128;
+        std::vector<short> in(n * 2);
+        for (int i = 0; i < n; i++) in[i * 2] = in[i * 2 + 1] = (short)(12000 * sin(2 * 3.14159265 * 1000 * i / 32000.0));
+        audio::Sbc enc;
+        SbcDecoder dec;
+        std::vector<float> out(n);
+        int bad = 0;
+        for (int f = 0; f < kFrames; f++) {
+            BYTE frame[audio::Sbc::kFrameBytes];
+            enc.Encode((const short (*)[2])&in[f * 128 * 2], frame);
+            if (dec.Decode(frame, audio::Sbc::kFrameBytes, &out[f * 128]) != 128) bad++;
+        }
+        double best = 0; int bestLag = 0; double gain = 0;
+        for (int lag = 0; lag < 200; lag++) {
+            double xy = 0, xx = 0, yy = 0;
+            for (int i = 1024; i < n - 256; i++) { double x = in[i * 2] / 32768.0, y = out[i + lag]; xy += x * y; xx += x * x; yy += y * y; }
+            double c = xy / sqrt(xx * yy + 1e-12);
+            if (fabs(c) > fabs(best)) { best = c; bestLag = lag; gain = sqrt(yy / xx); }
+        }
+        char text[160];
+        sprintf_s(text, "bad frames %d, correlation %.4f at lag %d, gain %.3f\n", bad, best, bestLag, gain);
+        HANDLE file = CreateFileW(cmdLine + 9, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD written;
+        if (file != INVALID_HANDLE_VALUE) { WriteFile(file, text, (DWORD)strlen(text), &written, nullptr); CloseHandle(file); }
+        return 0;
+    }
     if (!wcscmp(cmdLine, L"/exit")) {       // (the installer) close a running copy the normal way, so it
         HWND tray = FindWindowW(L"DS4NativeTray", nullptr);    // shows the controllers it hid again
         if (!tray) return 0;
@@ -4258,6 +5061,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     if (GetEnvironmentVariableW(L"DS4NATIVE_SELFTEST", env, MAX_PATH)) g_selfTest = env;
     bool selfTest = !g_selfTest.empty();
     bool demo = GetEnvironmentVariableW(L"DS4NATIVE_DEMO", env, MAX_PATH) != 0;
+    g_testMic = micout::g_dry = selfTest && GetEnvironmentVariableW(L"DS4NATIVE_MICDRY", env, MAX_PATH) != 0;
+    g_noInput = selfTest;
     if (selfTest) SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 
     g_single = CreateMutexW(nullptr, TRUE, selfTest ? L"Local\\DS4Native.SelfTest" : L"Local\\DS4Native.Tray");
@@ -4281,6 +5086,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     LoadGlobals();
     LoadShortcuts();
     audio::LoadSource();
+    micout::LoadDest();
     hidhide::LoadOurs();
     if (!demo) hidhide::WhitelistSelf();    // before opening any controller: it may be hidden already
     else hidhide::g_ready = hidhide::Installed();   // the demo touches nothing, but shows the switch as it would be
@@ -4357,6 +5163,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     SyncHiding();
     StopChroma();
     audio::Want(false);
+    micout::Want(false);
     if (g_vigem) {
         vigem_disconnect(g_vigem);
         vigem_free(g_vigem);
