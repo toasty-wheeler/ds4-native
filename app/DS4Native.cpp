@@ -25,6 +25,7 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <dwmapi.h>
+#include <shobjidl.h>
 #include <commctrl.h>
 #include <bluetoothapis.h>
 #include <setupapi.h>
@@ -43,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ViGEm/Client.h>
+#include "SpoutDX.h"                        // Spout2 (the stream overlay)
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -60,7 +62,7 @@
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 static const wchar_t kAppName[] = L"DS4-Native";
-static const wchar_t kVersion[] = L"1.1.0";
+static const wchar_t kVersion[] = L"1.2.0";
 static const wchar_t kRegKey[]  = L"Software\\DS4Native";
 static const wchar_t kRunKey[]  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const UINT WM_TRAY     = WM_APP + 1;
@@ -119,12 +121,14 @@ static const ULONGLONG kIdleMs = 10 * 60 * 1000;
 static std::atomic<bool> g_enabled{true};   // the master switch
 static bool g_testMic;                      // self-test (DS4NATIVE_MICDRY): mic on, decoded and counted, played nowhere
 static bool g_noInput;                      // self-test: never send input (mouse, keys, actions, virtual pad)
+static bool g_testSpout;                    // self-test (DS4NATIVE_SPOUT): the stream overlay's sender on
 static SRWLOCK g_dumpLock = SRWLOCK_INIT;   // ... and the first reports of each kind, in hex
 static std::string g_dump;
 static int g_dumpCount[256];
 enum ThemeMode { THEME_AUTO, THEME_LIGHT, THEME_DARK };
 static int  g_themeMode = THEME_AUTO;
 static bool g_onTop;
+static bool g_spoutOn;                      // the stream overlay (Spout2) is on
 
 static DWORD RegGet(const wchar_t* sub, const wchar_t* name, DWORD def) {
     std::wstring key = kRegKey;
@@ -144,12 +148,15 @@ static void LoadGlobals() {
     g_enabled = true;                       // (no switch for it in the window any more: "Xbox controller" does it)
     g_themeMode = (int)min(RegGet(nullptr, L"Theme", THEME_AUTO), (DWORD)THEME_DARK);
     g_onTop = RegGet(nullptr, L"OnTop", 0) != 0;
+    g_spoutOn = RegGet(nullptr, L"StreamOverlay", 0) != 0;
 }
 
+static void ApplySpout();
 static void SaveGlobals() {
     RegPut(nullptr, L"Enabled", g_enabled);
     RegPut(nullptr, L"Theme", g_themeMode);
     RegPut(nullptr, L"OnTop", g_onTop);
+    RegPut(nullptr, L"StreamOverlay", g_spoutOn);
 }
 
 static std::wstring ExePath() {
@@ -498,10 +505,30 @@ struct PadState {
     BYTE  counter = 0;                  // the report's own count (6 bits): gaps are lost reports
 };
 
+// Generic HID gamepads (anything that isn't a DualShock 4: 8BitDo pads in DirectInput mode,
+// USB pads, ...): which HID button is which Xbox button (0: none), and where the axes are.
+struct GenericMap { USHORT a, b, x, y, lb, rb, lt, rt, back, start, guide, ls, rs; const wchar_t* name; };
+// 8BitDo's DirectInput layout (as in SDL's controller database), and a common default.
+static const GenericMap k8BitDoMap = { 2, 1, 5, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, L"8BitDo layout" };
+static const GenericMap kStandardMap = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 11, 12, L"standard layout" };
+
+struct GenericAxis { USHORT page = 0, usage = 0; LONG lo = 0, hi = 0; bool present = false; };
+struct GenericLayout {
+    PHIDP_PREPARSED_DATA parsed = nullptr;
+    GenericMap map = kStandardMap;
+    GenericAxis lx, ly, rx, ry, lt, rt, hat;
+    GenericAxis battery;                    // a battery level in its input reports, if it has one
+    GenericAxis batteryFeature;             // ... or in a feature report (asked for now and then)
+    BYTE batteryReport = 0;                 // that feature report's id
+    std::wstring fields;                    // what it reports, for Driver status
+};
+
 struct Pad {
     std::wstring path, instanceId, serial, name;
-    USHORT pid = 0;
+    USHORT pid = 0, vid = 0;
     bool   bluetooth = false, dongle = false, fake = false;
+    bool   generic = false;                 // a generic HID gamepad, not a DualShock 4
+    GenericLayout layout;
     HANDLE h = INVALID_HANDLE_VALUE, thread = nullptr;
     USHORT inLen = 0, outLen = 0, featLen = 0;
     std::atomic<bool> stop{false}, gone{false}, ready{false};
@@ -993,31 +1020,34 @@ struct TouchMouse {
     double cx = 0, cy = 0;              // where we put the cursor (sub-pixel), absolute screen px
     bool  placed = false;
     float velocity = 0;                 // finger speed, smoothed over ~80 ms (touch units a second)
-    DWORD up = 0;                       // the MOUSEEVENTF_*UP for a button a pad click is holding
-    // A press of the pad is only a click if the finger stays put: it's pending until it's let go
-    // quickly or held still (then it clicks), or the finger slides (then it was navigating).
-    bool  pending = false, cancelled = false;
-    DWORD pendDown = 0, pendUp = 0;
-    ULONGLONG pressAt = 0;
-    float pressMoved = 0;
+    DWORD up = 0;                       // the MOUSEEVENTF_*UP for a button that's down (held, or a release Windows refused)
+    float pressMoved = 0;               // how far the finger slid since the pad was pressed
     // Taps (with "Tap to click"): one or two fingers down briefly with little movement.
     int   tapFingers = 0;
     bool  tapPressed = false;
     ULONGLONG tapAt = 0;
     float tapMoved = 0;
 };
-static const ULONGLONG kPressHoldMs = 250, kTapMs = 200;
+static const ULONGLONG kTapMs = 200;
 static const float kPressSlide = 40, kTapSlide = 40;     // touch units
 
-static void MouseInput(DWORD flags, LONG dx = 0, LONG dy = 0, DWORD data = 0) {
-    if (g_noInput) return;
+// False if Windows refused it: injected input is blocked while an elevated window (Task
+// Manager, an installer) has the cursor or focus, so a release can get lost.
+static bool MouseInput(DWORD flags, LONG dx = 0, LONG dy = 0, DWORD data = 0) {
+    if (g_noInput) return true;
     INPUT in{};
     in.type = INPUT_MOUSE;
     in.mi.dx = dx;
     in.mi.dy = dy;
     in.mi.dwFlags = flags;
     in.mi.mouseData = data;
-    SendInput(1, &in, sizeof(in));
+    return SendInput(1, &in, sizeof(in)) == 1;
+}
+
+// A click: down and up. A refused up is kept to be retried, or the button would stay held
+// and every move after it would drag.
+static void MouseClick(TouchMouse& m, DWORD down, DWORD up) {
+    if (MouseInput(down) && !MouseInput(up)) m.up = up;
 }
 
 static void TwoFingerButtons(Pad* p, DWORD* down, DWORD* up) {
@@ -1026,19 +1056,21 @@ static void TwoFingerButtons(Pad* p, DWORD* down, DWORD* up) {
     *up = middle ? MOUSEEVENTF_MIDDLEUP : MOUSEEVENTF_RIGHTUP;
 }
 
-// One finger moves the cursor, two scroll. Pressing the pad and keeping the finger still
-// clicks (left, or right on the right half with split clicks; with two fingers, right or
-// middle); a press that slides is navigation and doesn't click. With "Tap to click", a quick
-// tap clicks too (two fingers: right or middle).
+// One finger moves the cursor, two scroll. Pressing the pad is the mouse button, exactly: down
+// when pressed, up when let go, and sliding while it's pressed drags (left, or right on the
+// right half with split clicks; two fingers: right or middle). With "Tap to click", a quick tap
+// clicks too (two fingers: right or middle).
 static void UpdateTouchMouse(Pad* p, TouchMouse& m, const PadState& s, DWORD before, ULONGLONG now, float dt) {
     if (!p->set[S_TPMOUSE]) {
-        if (m.up) { MouseInput(m.up); m.up = 0; }
-        m.had[0] = m.had[1] = m.pending = false;
+        if (m.up && MouseInput(m.up)) m.up = 0;
+        m.had[0] = m.had[1] = false;
         m.tapFingers = 0;
         return;
     }
     int fingers = s.touch[0] + s.touch[1];
-    bool down = (s.buttons & B_TOUCH) != 0, wasDown = (before & B_TOUCH) != 0;
+    // The pad counts as pressed only with a finger on it: its click switch can bounce or stick
+    // on its own, and a press the switch never lets go of would otherwise drag forever.
+    bool down = (s.buttons & B_TOUCH) && fingers > 0, wasDown = (before & B_TOUCH) && (m.had[0] || m.had[1]);
 
     // How far the fingers moved since the last report (the same fingers only).
     float moved = 0, dx = 0, dy = 0;
@@ -1051,39 +1083,20 @@ static void UpdateTouchMouse(Pad* p, TouchMouse& m, const PadState& s, DWORD bef
     }
     if (same) { dx /= same; dy /= same; }
 
-    // The press: which button it would be, and whether it becomes a click.
+    // The press: the button goes down, and stays down until the pad is let go.
     if (down && !wasDown && !m.up) {
-        m.pendDown = MOUSEEVENTF_LEFTDOWN; m.pendUp = MOUSEEVENTF_LEFTUP;
+        DWORD dn = MOUSEEVENTF_LEFTDOWN, up = MOUSEEVENTF_LEFTUP;
         int finger = s.touch[0] ? 0 : 1;
         if (fingers >= 2) {
-            TwoFingerButtons(p, &m.pendDown, &m.pendUp);
+            TwoFingerButtons(p, &dn, &up);
         } else if (p->set[S_TPSPLIT] && s.touch[finger] && s.tx[finger] >= 960) {
-            m.pendDown = MOUSEEVENTF_RIGHTDOWN; m.pendUp = MOUSEEVENTF_RIGHTUP;
+            dn = MOUSEEVENTF_RIGHTDOWN; up = MOUSEEVENTF_RIGHTUP;
         }
-        m.pending = true;
-        m.cancelled = false;
-        m.pressAt = now;
         m.pressMoved = 0;
+        if (MouseInput(dn)) m.up = up;
     }
-    if (m.pending) {
-        m.pressMoved += moved;
-        if (m.pressMoved >= kPressSlide) {              // sliding: navigating, not clicking
-            m.pending = false;
-            m.cancelled = true;
-        } else if (!down) {                             // let go quickly without sliding: a click
-            MouseInput(m.pendDown);
-            MouseInput(m.pendUp);
-            m.pending = false;
-        } else if (now - m.pressAt >= kPressHoldMs) {   // held still: the button stays down (drag)
-            MouseInput(m.pendDown);
-            m.up = m.pendUp;
-            m.pending = false;
-        }
-    }
-    if (!down && m.up) {
-        MouseInput(m.up);
-        m.up = 0;
-    }
+    if (m.up) m.pressMoved += moved;
+    if (!down && m.up && MouseInput(m.up)) m.up = 0;    // released (or retried until Windows takes it)
 
     if (fingers == 0) { m.velocity = 0; m.placed = false; }
 
@@ -1104,15 +1117,16 @@ static void UpdateTouchMouse(Pad* p, TouchMouse& m, const PadState& s, DWORD bef
             else if (p->set[S_TPSPLIT] && m.x[0] + m.x[1] > 0 && (m.had[0] ? m.x[0] : m.x[1]) >= 960) {
                 dn = MOUSEEVENTF_RIGHTDOWN; up = MOUSEEVENTF_RIGHTUP;
             }
-            MouseInput(dn);
-            MouseInput(up);
+            if (!m.up) MouseClick(m, dn, up);
         }
         m.tapFingers = 0;
     }
 
-    // Moving and scrolling (not while a press is still deciding).
+    // Moving and scrolling.
     float speed = p->set[S_TPSPEED] / 50.0f;
-    if (same && !m.pending) {
+    // (Not in the first few units after a press: pressing wobbles the finger, and a click
+    // shouldn't become a tiny drag.)
+    if (same && !(m.up && m.pressMoved < kPressSlide)) {
         if (fingers == 1) {
             // Reports come in bursts over Bluetooth and the touch position doesn't change in
             // every one, so the speed (for the gentle acceleration) is smoothed over time, and
@@ -1920,7 +1934,173 @@ static std::wstring HexOnly(const wchar_t* s) {
     return out;
 }
 
+static GenericAxis FindAxis(const HIDP_VALUE_CAPS* caps, int count, USHORT page, USHORT usage) {
+    GenericAxis a;
+    for (int i = 0; i < count; i++) {
+        const HIDP_VALUE_CAPS& c = caps[i];
+        USHORT lo = c.IsRange ? c.Range.UsageMin : c.NotRange.Usage, hi = c.IsRange ? c.Range.UsageMax : c.NotRange.Usage;
+        if (c.UsagePage != page || usage < lo || usage > hi) continue;
+        a.page = page; a.usage = usage; a.present = true;
+        a.lo = c.LogicalMin; a.hi = c.LogicalMax;
+        if (a.hi <= a.lo) { a.lo = 0; a.hi = (1 << min(c.BitSize, (USHORT)16)) - 1; }    // unsigned field
+        break;
+    }
+    return a;
+}
+
+static bool OpenGeneric(Pad* p) {
+    p->h = CreateFileW(p->path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                       OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (p->h == INVALID_HANDLE_VALUE)       // some only open for reading
+        p->h = CreateFileW(p->path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED, nullptr);
+    if (p->h == INVALID_HANDLE_VALUE) { g_openError = GetLastError(); return false; }
+    GenericLayout& L = p->layout;
+    if (!HidD_GetPreparsedData(p->h, &L.parsed)) return false;
+    HIDP_CAPS caps{};
+    HidP_GetCaps(L.parsed, &caps);
+    HidD_SetNumInputBuffers(p->h, 4);
+    p->inLen = caps.InputReportByteLength;
+    p->outLen = caps.OutputReportByteLength;
+    HIDP_VALUE_CAPS values[64];
+    USHORT count = min(caps.NumberInputValueCaps, (USHORT)64);
+    HidP_GetValueCaps(HidP_Input, values, &count, L.parsed);
+    L.lx = FindAxis(values, count, 1, 0x30);
+    L.ly = FindAxis(values, count, 1, 0x31);
+    GenericAxis z = FindAxis(values, count, 1, 0x32), rz = FindAxis(values, count, 1, 0x35);
+    GenericAxis rxAxis = FindAxis(values, count, 1, 0x33), ryAxis = FindAxis(values, count, 1, 0x34);
+    if (z.present && rz.present) {          // right stick on Z / Rz; Rx / Ry (if any) as triggers
+        L.rx = z; L.ry = rz;
+        L.lt = rxAxis; L.rt = ryAxis;
+    } else {
+        L.rx = rxAxis; L.ry = ryAxis;
+        L.lt = z; L.rt = rz;
+    }
+    GenericAxis brake = FindAxis(values, count, 2, 0xC5), gas = FindAxis(values, count, 2, 0xC4);
+    if (brake.present) L.lt = brake;
+    if (gas.present) L.rt = gas;
+    L.hat = FindAxis(values, count, 1, 0x39);
+    // A battery level, where the HID standard puts one: Generic Device Controls "Battery
+    // Strength", or the battery system page's state of charge / remaining capacity.
+    static const USHORT kBattery[][2] = { { 0x06, 0x20 }, { 0x85, 0x65 }, { 0x85, 0x66 }, { 0x84, 0x65 }, { 0x84, 0x66 } };
+    for (auto& b : kBattery) if (!L.battery.present) L.battery = FindAxis(values, count, b[0], b[1]);
+    HIDP_VALUE_CAPS features[64];
+    USHORT featureCount = min(caps.NumberFeatureValueCaps, (USHORT)64);
+    if (featureCount && HidP_GetValueCaps(HidP_Feature, features, &featureCount, L.parsed) == HIDP_STATUS_SUCCESS) {
+        for (auto& b : kBattery) {
+            if (L.battery.present || L.batteryFeature.present) break;
+            L.batteryFeature = FindAxis(features, featureCount, b[0], b[1]);
+            for (int i = 0; i < featureCount && L.batteryFeature.present; i++)
+                if (features[i].UsagePage == b[0]) { L.batteryReport = features[i].ReportID; break; }
+        }
+    } else {
+        featureCount = 0;
+    }
+    // What it reports (Driver status): input values, buttons, feature values.
+    wchar_t field[48];
+    L.fields = L"inputs";
+    for (int i = 0; i < count; i++) {
+        swprintf_s(field, L" %02X:%02X", values[i].UsagePage, values[i].IsRange ? values[i].Range.UsageMin : values[i].NotRange.Usage);
+        L.fields += field;
+    }
+    HIDP_BUTTON_CAPS buttonCaps[8];
+    USHORT buttonCount = min(caps.NumberInputButtonCaps, (USHORT)8);
+    if (buttonCount && HidP_GetButtonCaps(HidP_Input, buttonCaps, &buttonCount, L.parsed) == HIDP_STATUS_SUCCESS)
+        for (int i = 0; i < buttonCount; i++) {
+            const HIDP_BUTTON_CAPS& b = buttonCaps[i];
+            swprintf_s(field, L", buttons %02X:%d-%d", b.UsagePage, b.IsRange ? b.Range.UsageMin : b.NotRange.Usage,
+                       b.IsRange ? b.Range.UsageMax : b.NotRange.Usage);
+            L.fields += field;
+        }
+    if (featureCount) {
+        L.fields += L"; features";
+        for (int i = 0; i < featureCount; i++) {
+            swprintf_s(field, L" %02X:%02X(id %d)", features[i].UsagePage, features[i].IsRange ? features[i].Range.UsageMin : features[i].NotRange.Usage,
+                       features[i].ReportID);
+            L.fields += field;
+        }
+    }
+    L.map = p->vid == 0x2DC8 ? k8BitDoMap : kStandardMap;
+    wchar_t serial[64] = L"";
+    if (HidD_GetSerialNumberString(p->h, serial, sizeof(serial))) p->serial = HexOnly(serial);
+    if (p->serial.size() != 12) {
+        wchar_t id[24];
+        swprintf_s(id, L"hid%08x", Crc32((const BYTE*)p->instanceId.c_str(), p->instanceId.size() * sizeof(wchar_t)));
+        p->serial = id;
+    }
+    // Over Bluetooth many pads call themselves something generic ("Bluetooth Wireless
+    // Controller"): the name Windows paired it under is the better one.
+    ULONGLONG address;
+    if (p->bluetooth && SerialToAddress(p->serial, &address)) {
+        BLUETOOTH_FIND_RADIO_PARAMS params{ sizeof(params) };
+        HANDLE radio;
+        HBLUETOOTH_RADIO_FIND find = BluetoothFindFirstRadio(&params, &radio);
+        if (find) {
+            BLUETOOTH_DEVICE_INFO info{ sizeof(info) };
+            info.Address.ullLong = address;
+            if (BluetoothGetDeviceInfo(radio, &info) == ERROR_SUCCESS && info.szName[0]) p->name = info.szName;
+            CloseHandle(radio);
+            BluetoothFindRadioClose(find);
+        }
+    }
+    g_openError = 0;
+    return true;
+}
+
+// A generic pad's report, into the same state a DualShock 4's goes into.
+static bool ParseGeneric(Pad* p, BYTE* report, DWORD n, PadState& s) {
+    GenericLayout& L = p->layout;
+    if (!L.parsed) return false;
+    auto value = [&](const GenericAxis& a, BYTE fallback) -> BYTE {
+        if (!a.present) return fallback;
+        ULONG raw = 0;
+        if (HidP_GetUsageValue(HidP_Input, a.page, 0, a.usage, &raw, L.parsed, (PCHAR)report, n) != HIDP_STATUS_SUCCESS) return fallback;
+        LONG v = (LONG)raw;
+        if (a.lo < 0 && v > a.hi) v -= (LONG)(a.hi - a.lo + 1);     // signed field read unsigned
+        double t = (double)(v - a.lo) / (double)(a.hi - a.lo);
+        return (BYTE)max(0.0, min(255.0, t * 255.0 + 0.5));
+    };
+    USAGE pressed[64];
+    ULONG count = 64;
+    DWORD held = 0;                         // HID button usages 1..32 held
+    if (HidP_GetUsages(HidP_Input, 9, 0, pressed, &count, L.parsed, (PCHAR)report, n) == HIDP_STATUS_SUCCESS)
+        for (ULONG i = 0; i < count; i++) if (pressed[i] >= 1 && pressed[i] <= 32) held |= 1u << (pressed[i] - 1);
+    auto on = [&](USHORT usage) { return usage && (held & (1u << (usage - 1))); };
+    const GenericMap& m = L.map;
+    DWORD buttons = 0;
+    if (on(m.a)) buttons |= B_CROSS;
+    if (on(m.b)) buttons |= B_CIRCLE;
+    if (on(m.x)) buttons |= B_SQUARE;
+    if (on(m.y)) buttons |= B_TRIANGLE;
+    if (on(m.lb)) buttons |= B_L1;
+    if (on(m.rb)) buttons |= B_R1;
+    if (on(m.lt)) buttons |= B_L2;
+    if (on(m.rt)) buttons |= B_R2;
+    if (on(m.back)) buttons |= B_SHARE;
+    if (on(m.start)) buttons |= B_OPTIONS;
+    if (on(m.guide)) buttons |= B_PS;
+    if (on(m.ls)) buttons |= B_L3;
+    if (on(m.rs)) buttons |= B_R3;
+    if (L.hat.present) {                    // 8 directions from the bottom of the range; anything else is centred
+        ULONG raw = 0;
+        if (HidP_GetUsageValue(HidP_Input, 1, 0, 0x39, &raw, L.parsed, (PCHAR)report, n) == HIDP_STATUS_SUCCESS) {
+            LONG dir = (LONG)raw - L.hat.lo;
+            static const DWORD kHat[8] = { B_UP, B_UP | B_RIGHT, B_RIGHT, B_RIGHT | B_DOWN, B_DOWN, B_DOWN | B_LEFT, B_LEFT, B_LEFT | B_UP };
+            if (dir >= 0 && dir < 8 && L.hat.hi - L.hat.lo >= 7) buttons |= kHat[dir];
+        }
+    }
+    s.buttons = buttons;
+    s.lx = value(L.lx, 128); s.ly = value(L.ly, 128);
+    s.rx = value(L.rx, 128); s.ry = value(L.ry, 128);
+    s.l2 = max(value(L.lt, 0), (BYTE)((buttons & B_L2) ? 255 : 0));
+    s.r2 = max(value(L.rt, 0), (BYTE)((buttons & B_R2) ? 255 : 0));
+    s.imu = false;
+    if (L.battery.present) s.battery = (int)(value(L.battery, 0) * 100 / 255);     // else the feature report's, or unknown
+    return true;
+}
+
 static bool OpenPad(Pad* p) {
+    if (p->generic) return OpenGeneric(p);
     wchar_t pollEnv[16];
     if (GetEnvironmentVariableW(L"DS4NATIVE_POLL", pollEnv, 16)) { p->poll = _wtoi(pollEnv); p->pollFixed = true; }   // testing
     p->h = CreateFileW(p->path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -2309,6 +2489,8 @@ static DWORD WINAPI PadThread(LPVOID param) {
         SbcDecoder micDecoder;
         BatteryLife batteryLife;
         LoadBatteryLife(p, batteryLife);
+        ULONGLONG batteryAsked = 0;         // generic pads with the battery in a feature report
+        int genericBattery = -1;
         // Link quality: the reports' own counter says how many were sent; the share that
         // arrived, over ~2 s windows.
         ULONGLONG linkStart = GetTickCount64();
@@ -2318,7 +2500,7 @@ static DWORD WINAPI PadThread(LPVOID param) {
         int crcFails[9] = {};                // per report 0x11..0x19, in a row
         if (!p->dongle) SetReady(p, true);
         p->writerStop = false;
-        HANDLE writer = CreateThread(nullptr, 0, OutputThread, p, 0, nullptr);
+        HANDLE writer = p->generic ? nullptr : CreateThread(nullptr, 0, OutputThread, p, 0, nullptr);
         SetThreadPriority(writer, THREAD_PRIORITY_ABOVE_NORMAL);
 
         while (!p->stop && !failed) {
@@ -2341,7 +2523,7 @@ static DWORD WINAPI PadThread(LPVOID param) {
             // Bluetooth reports end in a CRC-32 of 0xA1 + the report: a corrupted one is dropped, so
             // garbage never turns into button presses or clicks. (If a report kind never matches,
             // its length is guessed wrong: after 50 in a row it's taken unchecked.)
-            if (got && p->bluetooth && n > 0 && buf[0] >= 0x11 && buf[0] <= 0x19) {
+            if (got && p->bluetooth && !p->generic && n > 0 && buf[0] >= 0x11 && buf[0] <= 0x19) {
                 DWORD len = buf[0] == 0x19 ? 547 : 78 + (buf[0] - 0x11) * 64;
                 int& fails = crcFails[buf[0] - 0x11];
                 if (len <= n && fails < 50) {
@@ -2363,9 +2545,9 @@ static DWORD WINAPI PadThread(LPVOID param) {
                 }
                 ReleaseSRWLockExclusive(&g_dumpLock);
             }
-            if (got && n > 0 && p->bluetooth) TakeMic(p, buf.data(), n, micDecoder);
-            if (got && p->bluetooth && buf[0] >= 0x12 && buf[0] <= 0x19 && !(buf[1] & 0x80)) linkGot++;   // sound only
-            if (got && n > 0 && ParseReport(p, buf.data(), n, next, &synced)) {
+            if (got && n > 0 && p->bluetooth && !p->generic) TakeMic(p, buf.data(), n, micDecoder);
+            if (got && p->bluetooth && !p->generic && buf[0] >= 0x12 && buf[0] <= 0x19 && !(buf[1] & 0x80)) linkGot++;   // sound only
+            if (got && n > 0 && (p->generic ? ParseGeneric(p, buf.data(), n, next) : ParseReport(p, buf.data(), n, next, &synced))) {
                 if (p->dongle) SetReady(p, synced);
                 if (synced) {
                     LARGE_INTEGER count;
@@ -2373,7 +2555,21 @@ static DWORD WINAPI PadThread(LPVOID param) {
                     float dt = lastCount.QuadPart ? min(0.1f, (float)(count.QuadPart - lastCount.QuadPart) / freq.QuadPart) : 0;
                     lastCount = count;
                     UpdateMotion(next, dt, p->motionReset.exchange(false));
-                    if (next.imu) UpdateBatteryLife(p, batteryLife, next, now);
+                    if (p->generic && p->layout.batteryFeature.present && now - batteryAsked >= 30000) {
+                        batteryAsked = now;
+                        std::vector<BYTE> feature(512);
+                        feature[0] = p->layout.batteryReport;
+                        HIDP_CAPS caps{};
+                        HidP_GetCaps(p->layout.parsed, &caps);
+                        ULONG raw = 0;
+                        const GenericAxis& a = p->layout.batteryFeature;
+                        if (caps.FeatureReportByteLength && HidD_GetFeature(p->h, feature.data(), caps.FeatureReportByteLength) &&
+                            HidP_GetUsageValue(HidP_Feature, a.page, 0, a.usage, &raw, p->layout.parsed, (PCHAR)feature.data(),
+                                               caps.FeatureReportByteLength) == HIDP_STATUS_SUCCESS && a.hi > a.lo)
+                            genericBattery = (int)max(0L, min(100L, ((LONG)raw - a.lo) * 100 / (a.hi - a.lo)));
+                    }
+                    if (p->generic && !p->layout.battery.present) next.battery = genericBattery;
+                    if (next.imu || (p->generic && next.battery >= 0)) UpdateBatteryLife(p, batteryLife, next, now);
                     if (next.imu) {
                         int step = haveCounter ? ((next.counter - lastCounter) & 63) : 1;
                         linkSent += step ? step : 64;   // 0: a whole lap went missing
@@ -2457,8 +2653,11 @@ static DWORD WINAPI PadThread(LPVOID param) {
         if (touchMouse.up) MouseInput(touchMouse.up);
         p->writerStop = true;               // the output thread stops rumble and sound, then ends
         SetEvent(p->outputWake);
-        WaitForSingleObject(writer, 3000);
-        CloseHandle(writer);
+        if (writer) {
+            WaitForSingleObject(writer, 3000);
+            CloseHandle(writer);
+        }
+        if (p->layout.parsed) { HidD_FreePreparsedData(p->layout.parsed); p->layout.parsed = nullptr; }
         CloseHandle(ov.hEvent);
         AcquireSRWLockExclusive(&g_serialLock);
         g_serials.erase(p->serial);
@@ -2473,7 +2672,7 @@ static DWORD WINAPI PadThread(LPVOID param) {
 
 // ---- finding controllers
 
-struct FoundPad { std::wstring path, instanceId; USHORT pid; bool bluetooth; };
+struct FoundPad { std::wstring path, instanceId; USHORT pid; bool bluetooth; bool generic; std::wstring name; USHORT vid; };
 
 static std::vector<FoundPad> FindPads() {
     std::vector<FoundPad> found;
@@ -2491,18 +2690,38 @@ static std::vector<FoundPad> FindPads() {
         std::wstring path = detail->DevicePath;
         std::transform(path.begin(), path.end(), path.begin(), towlower);
         bool usb = path.find(L"vid_054c") != std::wstring::npos, bt = path.find(L"vid&0002054c") != std::wstring::npos;
-        if (!usb && !bt) continue;
         static const USHORT kPids[] = { 0x05C4, 0x09CC, 0x0BA0 };
         USHORT pid = 0;
         for (USHORT candidate : kPids) {
             wchar_t tag[16];
             swprintf_s(tag, usb ? L"pid_%04x" : L"pid&%04x", candidate);
-            if (path.find(tag) != std::wstring::npos) pid = candidate;
+            if ((usb || bt) && path.find(tag) != std::wstring::npos) pid = candidate;
         }
-        if (!pid) continue;
         wchar_t id[512] = L"";
         SetupDiGetDeviceInstanceIdW(info, &dev, id, 512, nullptr);
-        found.push_back({ path, id, pid, bt });
+        if (pid) { found.push_back({ path, id, pid, bt, false, L"", 0x054C }); continue; }
+        // Any other HID gamepad or joystick. Xbox-type pads (XInput) are left alone: games
+        // know them already (their DirectInput mirror has "ig_" in its path).
+        if (path.find(L"&ig_") != std::wstring::npos) continue;
+        HANDLE h = CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        PHIDP_PREPARSED_DATA parsed;
+        HIDP_CAPS caps{};
+        bool pad = false;
+        if (HidD_GetPreparsedData(h, &parsed)) {
+            pad = HidP_GetCaps(parsed, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage == 1 && (caps.Usage == 4 || caps.Usage == 5);
+            HidD_FreePreparsedData(parsed);
+        }
+        wchar_t product[128] = L"";
+        HIDD_ATTRIBUTES attrs{ sizeof(attrs) };
+        if (pad) { HidD_GetProductString(h, product, sizeof(product)); HidD_GetAttributes(h, &attrs); }
+        CloseHandle(h);
+        if (!pad) continue;
+        std::wstring name = product;
+        while (!name.empty() && name.back() == L' ') name.pop_back();
+        if (name.empty()) name = L"Game controller";
+        bool overBluetooth = path.find(L"00001124-0000-1000-8000-00805f9b34fb") != std::wstring::npos;
+        found.push_back({ path, id, attrs.ProductID, overBluetooth, true, name, attrs.VendorID });
     }
     SetupDiDestroyDeviceInfoList(info);
     return found;
@@ -2531,14 +2750,38 @@ static Pad* SelectedPad() {
 
 static bool g_exiting;
 
+// Controllers set to be hidden stay hidden while the app runs, connected or not: hidden only
+// once a controller had connected, Steam (or anything else watching for controllers) could
+// open it in the moment it appeared and keep it, HidHide or not, and then turn its touchpad
+// into a second mouse fighting this one. Remembered across restarts; all shown again on exit.
+static std::set<std::wstring> g_keepHidden;
+static bool g_keepHiddenLoaded;
+
+static void SaveKeepHidden() {
+    std::vector<wchar_t> buf;
+    for (const std::wstring& s : g_keepHidden) { buf.insert(buf.end(), s.begin(), s.end()); buf.push_back(0); }
+    buf.push_back(0);
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"KeepHidden", REG_MULTI_SZ, buf.data(), (DWORD)(buf.size() * sizeof(wchar_t)));
+}
+
 static void SyncHiding() {
-    if (!hidhide::g_ready) return;
-    std::set<std::wstring> want;
-    if (!g_exiting && g_enabled && g_vigem) {
-        for (Pad* p : g_pads) {
-            if (p->ready && !p->fake && p->set[S_EMULATE] && p->set[S_HIDE] && !p->instanceId.empty()) want.insert(p->instanceId);
-        }
+    if (!hidhide::g_ready || g_noInput) return;     // (a test run leaves hiding alone)
+    if (!g_keepHiddenLoaded) {
+        g_keepHiddenLoaded = true;
+        wchar_t buf[8192];
+        DWORD size = sizeof(buf);
+        if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"KeepHidden", RRF_RT_REG_MULTI_SZ, nullptr, buf, &size) == ERROR_SUCCESS)
+            for (const wchar_t* s = buf; *s; s += wcslen(s) + 1) g_keepHidden.insert(s);
     }
+    bool changed = false;
+    for (Pad* p : g_pads) {                 // what the connected controllers are set to
+        if (!p->ready || p->fake || p->instanceId.empty()) continue;
+        if (p->set[S_EMULATE] && p->set[S_HIDE]) changed |= g_keepHidden.insert(p->instanceId).second;
+        else changed |= g_keepHidden.erase(p->instanceId) != 0;
+    }
+    if (changed) SaveKeepHidden();
+    std::set<std::wstring> want;
+    if (!g_exiting && g_enabled && g_vigem) want = g_keepHidden;
     hidhide::Sync(want);
 }
 
@@ -2561,8 +2804,10 @@ static void ScanPads() {
         p->instanceId = f.instanceId;
         p->pid = f.pid;
         p->bluetooth = f.bluetooth;
-        p->dongle = f.pid == 0x0BA0;
-        p->name = f.pid == 0x09CC ? L"DualShock 4 v2" : L"DualShock 4";
+        p->generic = f.generic;
+        p->vid = f.vid;
+        p->dongle = !f.generic && f.pid == 0x0BA0;
+        p->name = f.generic ? f.name : f.pid == 0x09CC ? L"DualShock 4 v2" : L"DualShock 4";
         p->thread = CreateThread(nullptr, 0, PadThread, p, 0, nullptr);
         SetThreadPriority(p->thread, THREAD_PRIORITY_ABOVE_NORMAL);
         g_pads.push_back(p);
@@ -2598,7 +2843,14 @@ static const Palette kDarkPalette = {
     gp::Color(255, 72, 72, 74), gp::Color(255, 58, 58, 60), gp::Color(255, 99, 99, 102),
     gp::Color(255, 44, 44, 46), gp::Color(255, 72, 72, 74), gp::Color(90, 0, 0, 0),
 };
-static const gp::Color kAccent(255, 10, 132, 255), kGreen(255, 52, 199, 89), kWhite(255, 255, 255, 255);
+static gp::Color kAccent(255, 10, 132, 255);      // Windows' accent colour once it's read (LoadAccentColour)
+static const gp::Color kGreen(255, 52, 199, 89), kWhite(255, 255, 255, 255);
+
+// Text on the accent colour: white, or near-black on a light accent.
+static gp::Color OnAccent() {
+    float luma = 0.2126f * kAccent.GetR() + 0.7152f * kAccent.GetG() + 0.0722f * kAccent.GetB();
+    return luma > 165 ? gp::Color(255, 28, 28, 30) : kWhite;
+}
 static const gp::Color kBatteryGreen(255, 52, 199, 89), kBatteryYellow(255, 255, 204, 0), kBatteryRed(255, 255, 59, 48);
 
 static bool g_dark;
@@ -2751,13 +3003,13 @@ static std::wstring SourceLabel() {
 }
 
 // Switch slots: a setting's own index for per-controller switches, then the two app switches.
-static const int kSlotStartup = S_COUNT, kSlotEnabled = S_COUNT + 1;
+static const int kSlotStartup = S_COUNT, kSlotEnabled = S_COUNT + 1, kSlotSpout = S_COUNT + 2;
 
 static std::vector<Elem> g_elems;
 static int   g_hover = -1, g_pressed = -1;
 static bool  g_themeOpen;
 static bool  g_startup;
-static float g_knob[kSlotEnabled + 1];
+static float g_knob[kSlotSpout + 1];
 
 static int SettingValue(int setting) {
     Pad* p = SelectedPad();
@@ -2766,7 +3018,7 @@ static int SettingValue(int setting) {
 
 static bool ToggleValue(int slot) {
     if (slot < S_COUNT) return SettingValue(slot) != 0;
-    return slot == kSlotEnabled ? g_enabled.load() : g_startup;
+    return slot == kSlotEnabled ? g_enabled.load() : slot == kSlotSpout ? g_spoutOn : g_startup;
 }
 
 static int AddElem(ElemKind kind, gp::RectF rc, int id, int sub = 0) {
@@ -2776,9 +3028,29 @@ static int AddElem(ElemKind kind, gp::RectF rc, int id, int sub = 0) {
 
 static bool Hovered(int elem) { return elem >= 0 && elem == g_hover; }
 
+// Switches that are on take Windows' accent colour (Settings > Personalisation > Colours).
+static gp::Color g_switchOn = kGreen;
+
+static void LoadAccentColour() {
+    DWORD abgr = 0, size = sizeof(abgr);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", L"AccentColor", RRF_RT_REG_DWORD, nullptr,
+                     &abgr, &size) == ERROR_SUCCESS) {
+        g_switchOn = kAccent = gp::Color(255, (BYTE)abgr, (BYTE)(abgr >> 8), (BYTE)(abgr >> 16));
+        return;
+    }
+    DWORD argb = 0;
+    BOOL opaque;
+    if (SUCCEEDED(DwmGetColorizationColor(&argb, &opaque))) {
+        g_switchOn = kAccent = gp::Color(255, (BYTE)(argb >> 16), (BYTE)(argb >> 8), (BYTE)argb);
+    } else {                                // no accent colour: the app's own green and blue
+        g_switchOn = kGreen;
+        kAccent = gp::Color(255, 10, 132, 255);
+    }
+}
+
 static void DrawSwitch(gp::Graphics& g, gp::RectF r, float t, bool dim = false) {
     const Palette& p = Pal();
-    FillRound(g, r, r.Height / 2, WithAlpha(Mix(p.switchOff, kGreen, t), dim ? 110 : 255));
+    FillRound(g, r, r.Height / 2, WithAlpha(Mix(p.switchOff, g_switchOn, t), dim ? 110 : 255));
     float d = r.Height - S(4);
     float x = r.X + S(2) + t * (r.Width - d - S(4));
     gp::SolidBrush shadow(gp::Color(50, 0, 0, 0)), knob(WithAlpha(kWhite, dim ? 150 : 255));
@@ -2911,7 +3183,7 @@ static void DrawButton(gp::Graphics& g, gp::RectF r, int id, const wchar_t* text
     if (!live) fill = WithAlpha(fill, primary ? 90 : 120);
     FillRound(g, r, S(8), fill);
     if (!primary) StrokeRound(g, r, S(8), p.line, S(1));
-    gp::Color text_ = primary ? kWhite : p.text;
+    gp::Color text_ = primary ? OnAccent() : p.text;
     Label(g, text, g_fonts.caption, live ? text_ : WithAlpha(text_, 120), r, gp::StringAlignmentCenter, gp::StringAlignmentCenter);
 }
 
@@ -3019,6 +3291,11 @@ static const std::vector<OutlinePoint>& DesignOutline() {
 
 // A shoulder button: a band along the top of the outline between u0 and u1, `offset` design
 // units out from it and `width` thick, with rounded ends. Returns its middle (for the label).
+// The light edge that sets the pad off the window's background; the stream overlay goes without
+// it (over a transparent background it reads as a white outline).
+static bool g_overlayDrawing;
+static gp::Color PadEdge(const Palette& p) { return g_overlayDrawing ? gp::Color(0, 0, 0, 0) : p.bodyEdge; }
+
 static gp::PointF DrawShoulderBand(gp::Graphics& g, const PadLayout& L, float u0, float u1, float offset, float width,
                                    gp::Color fill, gp::Color edge) {
     std::vector<OutlinePoint> top;
@@ -3043,11 +3320,11 @@ static void DrawShoulders(gp::Graphics& g, const PadLayout& L, float u0, float u
                           const wchar_t* bumperName, const wchar_t* triggerName) {
     const Palette& p = Pal();
     float pull = analog / 255.0f;
-    gp::PointF t = DrawShoulderBand(g, L, u0 - 25, u1 + 25, 52, 34, Mix(p.body, kAccent, pull), p.bodyEdge);
-    gp::PointF b = DrawShoulderBand(g, L, u0, u1, 17, 24, bumper ? kAccent : p.body, p.bodyEdge);
-    Label(g, triggerName, g_fonts.tiny, pull > 0.5f ? kWhite : p.subtext, gp::RectF(t.X - S(20), t.Y - S(8), S(40), S(16)),
+    gp::PointF t = DrawShoulderBand(g, L, u0 - 25, u1 + 25, 52, 34, Mix(p.body, kAccent, pull), PadEdge(p));
+    gp::PointF b = DrawShoulderBand(g, L, u0, u1, 17, 24, bumper ? kAccent : p.body, PadEdge(p));
+    Label(g, triggerName, g_fonts.tiny, pull > 0.5f ? OnAccent() : p.subtext, gp::RectF(t.X - S(20), t.Y - S(8), S(40), S(16)),
           gp::StringAlignmentCenter, gp::StringAlignmentCenter);
-    Label(g, bumperName, g_fonts.tiny, bumper ? kWhite : p.subtext, gp::RectF(b.X - S(20), b.Y - S(8), S(40), S(16)),
+    Label(g, bumperName, g_fonts.tiny, bumper ? OnAccent() : p.subtext, gp::RectF(b.X - S(20), b.Y - S(8), S(40), S(16)),
           gp::StringAlignmentCenter, gp::StringAlignmentCenter);
 }
 static float g_split;                   // the touchpad's split line (left / right click), 0 hidden .. 1 shown
@@ -3071,8 +3348,10 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
         delete shadowPath;
         gp::SolidBrush fill(p.body);
         g.FillPath(&fill, &body);
-        gp::Pen edge(p.bodyEdge, S(1.5));
-        g.DrawPath(&edge, &body);
+        if (!g_overlayDrawing) {
+            gp::Pen edge(p.bodyEdge, S(1.5));
+            g.DrawPath(&edge, &body);
+        }
     }
 
     // Light bar, along the top of the touchpad.
@@ -3240,9 +3519,9 @@ struct AmbientField {
     std::vector<float> fade;            // exp(-distance outside the outline / reach)
 };
 
-static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h) {
+static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, AmbientField& F) {
     if (!AmbientActive() || !g_canvas || &g != g_canvasGraphics) return;
-    static AmbientField F;
+
     float reach = S(kAmbientReach);
     if (F.x0 != L.x0 || F.y0 != L.y0 || F.scale != L.scale) {
         F.x0 = L.x0; F.y0 = L.y0; F.scale = L.scale;
@@ -3728,6 +4007,7 @@ static void DrawBattery(gp::Graphics& g, float centerX, float top, int level, co
 // Signal: four bars from the share of the controller's reports that arrive (Bluetooth has
 // no signal strength Windows will report, but lost reports are what a weak link means).
 static void DrawSignal(gp::Graphics& g, float x, float top, const Pad* pad) {
+    if (pad && pad->generic) return;        // (measured from the DualShock 4's own report counter)
     const Palette& p = Pal();
     if (!pad || !pad->bluetooth) return;
     int link = pad->link;
@@ -3822,6 +4102,7 @@ static void DrawMenu(gp::Graphics& g, gp::RectF anchor, float width, float limit
 }
 
 static gp::Color PadLight(Pad* p, int battery) {
+    if (p->generic) return gp::Color(0, 0, 0, 0);       // no light bar
     BYTE rgb[3];
     LightColour(p, battery, rgb);
     return gp::Color((BYTE)(p->set[S_LIGHTMODE] == LIGHT_OFF ? 0 : 255), rgb[0], rgb[1], rgb[2]);
@@ -4036,7 +4317,10 @@ static unsigned g_paintedSeq;
 static Pad* g_paintedPad;
 static const ULONGLONG kMapShowMs = 1500, kSearchDotMs = 400;
 
+static void UpdateTaskbarBattery(bool force);
+
 static void PaintWindow(HWND hwnd, HDC target) {
+    UpdateTaskbarBattery(false);
     RECT rc;
     GetClientRect(hwnd, &rc);
     if (rc.right <= 0 || rc.bottom <= 0) return;
@@ -4058,7 +4342,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
 
         Pad* pad = SelectedPad();
         bool live = pad != nullptr;
-        for (int slot = 0; slot <= kSlotEnabled; slot++) {
+        for (int slot = 0; slot <= kSlotSpout; slot++) {
             float goal = ToggleValue(slot) ? 1.0f : 0.0f;
             g_knob[slot] += (goal - g_knob[slot]) * 0.35f;
             if (fabsf(goal - g_knob[slot]) < 0.01f) g_knob[slot] = goal;
@@ -4109,7 +4393,8 @@ static void PaintWindow(HWND hwnd, HDC target) {
         g_split += (splitGoal - g_split) * 0.18f;
         if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
         UpdateAmbient(s, live);
-        DrawAmbient(g, layout, w, h);
+        static AmbientField windowField;
+        DrawAmbient(g, layout, w, h, windowField);
 
         DrawTabs(g, m, S(10), w - 2 * m, pad);
 
@@ -4138,7 +4423,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
         }
         Label(g, title, g_fonts.title, p.text, gp::RectF(m + S(26), headerY + S(14), S(330), S(28)));
         Label(g, status, g_fonts.caption, p.subtext, gp::RectF(m, headerY + S(42), S(400), S(20)));
-        float batteryX = pad && pad->bluetooth ? w / 2 - S(50) : w / 2;     // the signal goes beside it
+        float batteryX = pad && pad->bluetooth && !pad->generic ? w / 2 - S(50) : w / 2;     // the signal goes beside it
         DrawBattery(g, batteryX, headerY + S(22), pad ? s.battery : -1, BatteryNote(pad, s).c_str());
         DrawSignal(g, w / 2 + S(22), headerY + S(25), pad);
         gp::RectF themeBtn(w - m - S(124), headerY + S(20), S(124), S(36));
@@ -4165,20 +4450,26 @@ static void PaintWindow(HWND hwnd, HDC target) {
             for (int i = 0; i < kEmulationCount; i++) {
                 int setting = kEmulationToggles[i];
                 if (i) separator(y);
-                bool usable = live && (setting != S_HIDE || hidhide::g_ready) && (setting != S_IDLE || pad->bluetooth);
+                bool ds4Only = setting == S_RUMBLE || setting == S_MOTION;
+                bool usable = live && (setting != S_HIDE || hidhide::g_ready) && (setting != S_IDLE || pad->bluetooth)
+                              && !(ds4Only && pad->generic);
                 const wchar_t* detail = setting == S_HIDE && !hidhide::g_ready ? L"Needs the HidHide driver"
+                                      : ds4Only && pad && pad->generic ? L"Not on this controller"
                                       : setting == S_MOTION && pad && !s.imu ? L"Waiting for motion data"
                                       : ToggleTitle(setting, true);
-                DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), setting, ToggleTitle(setting, false), detail, usable);
+                const wchar_t* title = setting == S_HIDE && pad && pad->generic ? L"Hide the real pad" : ToggleTitle(setting, false);
+                DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), setting, title, detail, usable);
                 y += S(kRowH);
                 if (setting == S_RUMBLE) {          // its strength, right under it
-                    DrawSliderRow(g, gp::RectF(lx, y - S(8), sideW, S(kSliderRowH)), SLIDER_RUMBLE, live && pad->set[S_RUMBLE]);
+                    DrawSliderRow(g, gp::RectF(lx, y - S(8), sideW, S(kSliderRowH)), SLIDER_RUMBLE, live && !pad->generic && pad->set[S_RUMBLE]);
                     y += S(kSliderRowH) - S(8);
                 }
             }        } else if (g_leftTab == 1) {
-            bool mouse = live && pad->set[S_TPMOUSE];
+            bool touch = live && !pad->generic;     // generic pads have no touchpad
+            bool mouse = touch && pad->set[S_TPMOUSE];
             FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * 5 + S(kSliderRowH)), S(12), p.card);
-            DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPMOUSE, ToggleTitle(S_TPMOUSE, false), ToggleTitle(S_TPMOUSE, true), live);
+            DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPMOUSE, ToggleTitle(S_TPMOUSE, false),
+                          live && pad->generic ? L"This controller has no touchpad" : ToggleTitle(S_TPMOUSE, true), touch);
             y += S(kRowH); separator(y);
             DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPSPLIT, ToggleTitle(S_TPSPLIT, false),
                           ToggleTitle(S_TPSPLIT, true), mouse);
@@ -4198,7 +4489,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
                   gp::RectF(lx + S(4), y, sideW, S(18)));
             if (!mouse) g_twoMenuOpen = false;
         } else {
-            bool bt = live && pad->bluetooth, on = bt && pad->set[S_AUDIO];
+            bool bt = live && pad->bluetooth && !pad->generic, on = bt && pad->set[S_AUDIO];
             bool mouse = live && pad->set[S_TPMOUSE];
             FillRound(g, gp::RectF(lx, y, sideW, S(kRowH) * 6 + S(kSliderRowH)), S(12), p.card);
             DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_AUDIO, ToggleTitle(S_AUDIO, false),
@@ -4215,7 +4506,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
             DrawSliderRow(g, gp::RectF(lx, y, sideW, S(kSliderRowH)), SLIDER_AUDIOVOL, bt);
             y += S(kSliderRowH); separator(y);
             DrawToggleRow(g, gp::RectF(lx, y, sideW, S(kRowH)), S_TPVOLUME, ToggleTitle(S_TPVOLUME, false),
-                          mouse ? L"Needs the touchpad mouse off" : ToggleTitle(S_TPVOLUME, true), live && !mouse);
+                          mouse ? L"Needs the touchpad mouse off" : ToggleTitle(S_TPVOLUME, true), live && !pad->generic && !mouse);
             y += S(kRowH); separator(y);
             const wchar_t* micDetail = !bt ? (live ? L"On USB it's a Windows mic already" : ToggleTitle(S_MIC, true))
                                      : s.mic ? (pad->set[S_MIC] ? L"Plugged in, on" : L"Plugged in")
@@ -4256,7 +4547,8 @@ static void PaintWindow(HWND hwnd, HDC target) {
         int mode = SettingValue(S_LIGHTMODE);
         y += S(20);
         DrawSectionLabel(g, rx, y, sideW, L"LIGHT BAR");
-        if (live && mode == LIGHT_CHROMA) {
+        bool lightLive = live && !pad->generic;     // generic pads have no light bar
+        if (lightLive && mode == LIGHT_CHROMA) {
             int state = g_chromaState;
             gp::Color dot = state == CHROMA_LIVE ? kGreen : state == CHROMA_WAITING || state == CHROMA_STARTING || state == CHROMA_OFF
                           ? kBatteryYellow : kBatteryRed;
@@ -4268,19 +4560,19 @@ static void PaintWindow(HWND hwnd, HDC target) {
             g.FillEllipse(&dotBrush, note.X + note.Width - measured.Width - S(12), y + S(7), S(7), S(7));
         }
         y += S(24);
-        DrawSegmented(g, gp::RectF(rx, y, sideW, S(34)), SEG_LIGHT, lights, LIGHT_COUNT, mode, live);
+        DrawSegmented(g, gp::RectF(rx, y, sideW, S(34)), SEG_LIGHT, lights, LIGHT_COUNT, mode, lightLive);
         y += S(34) + S(10);
         FillRound(g, gp::RectF(rx, y, sideW, S(kSliderRowH) * 3), S(12), p.card);
-        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 4, live && mode != LIGHT_OFF);
+        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 4, lightLive && mode != LIGHT_OFF);
         y += S(kSliderRowH);
         g.DrawLine(&line, rx + S(16), y, rx + sideW, y);
-        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 5, live && (mode == LIGHT_COLOUR || mode == LIGHT_CHROMA));
+        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 5, lightLive && (mode == LIGHT_COLOUR || mode == LIGHT_CHROMA));
         y += S(kSliderRowH);
         g.DrawLine(&line, rx + S(16), y, rx + sideW, y);
-        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 6, live && mode == LIGHT_RAINBOW);
+        DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 6, lightLive && mode == LIGHT_RAINBOW);
         // The controller; under it the raw values and the last mapping, and the motion card.
         DrawPad(g, layout, s, light, live ? (emulating ? 1.0f : 0.75f) : 0.4f);
-        if (live) DrawPad3D(g, preview, s, light, pad->set[S_MOTION] && s.imu, 1);   // drag to spin, double-click to level
+        if (live && !pad->generic) DrawPad3D(g, preview, s, light, pad->set[S_MOTION] && s.imu, 1);   // drag to spin, double-click to level
         (void)previewElem;
         float infoX = cxl, infoW = cxr - cxl, ty = preview.Y + preview.Height + S(4);
         if (pad) {
@@ -4301,10 +4593,12 @@ static void PaintWindow(HWND hwnd, HDC target) {
         // Footer card: start with Windows, then the app buttons on the right.
         gp::RectF footer(m, h - S(kFooterH), w - 2 * m, S(kFooterH) - S(16));
         FillRound(g, footer, S(12), p.card);
-        DrawToggleRow(g, gp::RectF(footer.X, footer.Y, S(300), footer.Height), kSlotStartup, L"Start with Windows", L"Waits in the tray");
+        DrawToggleRow(g, gp::RectF(footer.X, footer.Y, S(250), footer.Height), kSlotStartup, L"Start with Windows", L"Waits in the tray");
+        DrawToggleRow(g, gp::RectF(footer.X + S(250), footer.Y, S(250), footer.Height), kSlotSpout, L"Stream overlay",
+                      L"Spout2, e.g. for OBS");
         float bx = footer.X + footer.Width - S(12), by = footer.Y + (footer.Height - S(32)) / 2;
         bx -= S(124);
-        DrawButton(g, gp::RectF(bx, by, S(124), S(32)), BTN_RUMBLE, L"Test rumble", true, live);
+        DrawButton(g, gp::RectF(bx, by, S(124), S(32)), BTN_RUMBLE, L"Test rumble", true, live && !pad->generic);
         bx -= S(10) + S(124);
         DrawButton(g, gp::RectF(bx, by, S(124), S(32)), BTN_SHORTCUTS, L"Shortcuts", false);
         bx -= S(10) + S(124);
@@ -4415,14 +4709,19 @@ static std::wstring StatusText() {
                    p->dongle ? L"wireless adapter" : p->bluetooth ? L"Bluetooth" : L"USB",
                    p->emulating ? L"emulating" : L"not emulating", p->serial.c_str(), p->inLen, p->outLen);
         text += line;
+        if (p->generic) {
+            swprintf_s(line, L"     generic gamepad %04X:%04X, %s, battery %s\n     reports: %.300s\n", p->vid, p->pid,
+                       p->layout.map.name, p->layout.battery.present ? L"in its reports" : p->layout.batteryFeature.present
+                       ? L"in a feature report" : L"not reported", p->layout.fields.c_str());
+            text += line;
+        }
         if (s.imu) {
             swprintf_s(line, L"     motion: accel %d %d %d, gyro %d %d %d, moving %+.2f %+.2f %+.2f g\n", s.accel[0], s.accel[1],
                        s.accel[2], s.gyro[0], s.gyro[1], s.gyro[2], s.lin[0], s.lin[1], s.lin[2]);
             text += line;
         }
-            swprintf_s(line, L"     link: %d%% of reports arrive, %d reports/s (interval setting %d), %u corrupted dropped\n", p->link.load(),
-                   p->reportRate.load(), p->poll.load(), p->crcBad.load());
-        text += line;
+        if (!p->generic) { swprintf_s(line, L"     link: %d%% of reports arrive, %d reports/s (interval setting %d), %u corrupted dropped\n", p->link.load(),
+                   p->reportRate.load(), p->poll.load(), p->crcBad.load()); text += line; }
         if (p->set[S_MIC]) {
             swprintf_s(line, L"     mic: %s, headset mic %s, %u frames, %u unreadable, %u echo skipped, target 0x%02X, output %s (0x%08lX)\n",
                        p->micOn ? L"on" : L"off", s.mic ? L"plugged in" : L"not plugged in", p->micFrames.load(),
@@ -4463,6 +4762,12 @@ static void Activate(HWND hwnd, const Elem& e) {
     Pad* pad = SelectedPad();
     switch (e.kind) {
     case E_TOGGLE:
+        if (e.id == kSlotSpout) {
+            g_spoutOn = !g_spoutOn;
+            SaveGlobals();
+            ApplySpout();
+            return;
+        }
         if (e.id == kSlotStartup) {
             SetStartsWithWindows(!g_startup);
             g_startup = StartsWithWindows();
@@ -4603,7 +4908,7 @@ static bool Animating() {
     if (AmbientActive() || (g_leftTab == 2 && pad->audioOn)) return true;
     ULONGLONG now = GetTickCount64();
     if (now - g_mapTick < kMapShowMs + 100 || now < pad->testUntil + 100 || pad->rumbleStrong || pad->rumbleWeak) return true;
-    for (int slot = 0; slot <= kSlotEnabled; slot++) {
+    for (int slot = 0; slot <= kSlotSpout; slot++) {
         if (g_knob[slot] != (ToggleValue(slot) ? 1.0f : 0.0f)) return true;
     }
     return false;
@@ -4616,7 +4921,42 @@ static void ShowWindowFront() {
     SetTimer(g_window, 1, 16, nullptr);     // repaint ~60 fps while shown, if anything moved
 }
 
+// The window's taskbar button shows the selected controller's battery as its progress bar, in
+// the battery's colour (green, yellow under 35 %, red under 15 %); none when it isn't known.
+static ITaskbarList3* g_taskbar;
+static wchar_t g_taskbarNote[96];           // self-test: what the taskbar was last told
+static const UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarButtonCreated");
+
+static void UpdateTaskbarBattery(bool force = false) {
+    if (!g_taskbar || !g_window) return;
+    int level = -1;
+    Pad* p = SelectedPad();
+    if (p && p->ready) {
+        AcquireSRWLockShared(&p->lock);
+        level = p->state.battery;
+        ReleaseSRWLockShared(&p->lock);
+    }
+    TBPFLAG state = level < 0 ? TBPF_NOPROGRESS : level < kBatteryCriticalLevel ? TBPF_ERROR
+                  : level < kBatteryLowLevel ? TBPF_PAUSED : TBPF_NORMAL;
+    static int lastLevel = -2;
+    static TBPFLAG lastState;
+    if (!force && level == lastLevel && state == lastState) return;
+    lastLevel = level;
+    lastState = state;
+    HRESULT a = g_taskbar->SetProgressState(g_window, state);
+    HRESULT b = level >= 0 ? g_taskbar->SetProgressValue(g_window, max(level, 1), 100) : S_OK;
+    swprintf_s(g_taskbarNote, L"Taskbar: battery %d%%, state %d (%s)\n", level, (int)state,
+               SUCCEEDED(a) && SUCCEEDED(b) ? L"set" : L"FAILED");
+}
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TASKBARCREATED) {         // (again whenever the button is made anew)
+        if (!g_taskbar && FAILED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_taskbar))))
+            g_taskbar = nullptr;
+        if (g_taskbar && FAILED(g_taskbar->HrInit())) { g_taskbar->Release(); g_taskbar = nullptr; }
+        UpdateTaskbarBattery(true);
+        return 0;
+    }
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -4750,7 +5090,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_SETTINGCHANGE:
-        if (lp && !lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") && g_themeMode == THEME_AUTO) ApplyTheme();
+        if (lp && !lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet")) {
+            LoadAccentColour();             // the accent colour may have changed too
+            if (g_themeMode == THEME_AUTO) ApplyTheme();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        LoadAccentColour();
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_CAPTURECHANGED:
         if ((HWND)lp != hwnd) {             // capture taken away mid-drag
@@ -4816,7 +5164,125 @@ static void UpdateTray(HWND hwnd, DWORD action) {
 }
 
 // After anything changed: selection, hiding, Chroma, tray and window.
+// ---- stream overlay: the selected controller with its ambilight, on a transparent
+// background, sent 60 times a second as a Spout2 sender ("DS4-Native") that OBS (with the
+// Spout2 plugin) and other programs can take in. Keeps going with the window closed.
+
+static const int kOverlayW = 800, kOverlayH = 560;
+static const UINT WM_OVERLAY = WM_APP + 6;  // time for the next overlay frame (from the pacing thread)
+static spoutDX* g_spout;
+static HANDLE g_overlayClock;               // the pacing thread
+static std::atomic<bool> g_overlayStop, g_overlayPending;
+static LONGLONG g_overlayFrames, g_overlayFirst;  // frames sent, and when the first went (QPC)
+
+static DWORD WINAPI OverlayClock(void*) {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    LARGE_INTEGER freq, start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    for (LONGLONG frame = 1; !g_overlayStop; frame++) {
+        // frame n is due at start + n/60 s; a late frame doesn't push the rest back
+        QueryPerformanceCounter(&now);
+        LONGLONG due = start.QuadPart + frame * freq.QuadPart / 60;
+        if (due < now.QuadPart - freq.QuadPart / 10) { start = now; frame = 0; continue; }   // fell well behind
+        LARGE_INTEGER wait;
+        wait.QuadPart = -max(0LL, (due - now.QuadPart) * 10000000 / freq.QuadPart);   // 100 ns units, relative
+        SetWaitableTimer(timer, &wait, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, 100);
+        if (!g_overlayPending.exchange(true)) PostMessageW(g_tray, WM_OVERLAY, 0, 0);   // one at a time
+    }
+    CloseHandle(timer);
+    return 0;
+}
+
+static gp::Bitmap* RenderOverlay() {
+    static gp::Bitmap* image;
+    if (!image) image = new gp::Bitmap(kOverlayW, kOverlayH, PixelFormat32bppPARGB);
+    {
+        gp::Graphics og(image);
+        og.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+        og.SetTextRenderingHint(gp::TextRenderingHintAntiAliasGridFit);
+        og.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+        og.Clear(gp::Color(0, 0, 0, 0));
+        Pad* pad = SelectedPad();
+        if (pad) {
+            AcquireSRWLockShared(&pad->lock);
+            PadState s = pad->state;
+            ReleaseSRWLockShared(&pad->lock);
+            if (!IsWindowVisible(g_window)) {   // the window animates these while it's open
+                UpdateAmbient(s, true);
+                float splitGoal = pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
+                g_split += (splitGoal - g_split) * 0.18f;
+                if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
+            }
+            PadLayout L = LayoutPad(gp::RectF(40, 60, kOverlayW - 80.0f, kOverlayH - 100.0f));
+            g_canvas = image;                   // glows and the ambilight blend straight into it
+            g_canvasGraphics = &og;
+            g_overlayDrawing = true;
+            static AmbientField overlayField;
+            DrawAmbient(og, L, (float)kOverlayW, (float)kOverlayH, overlayField);
+            DrawPad(og, L, s, PadLight(pad, s.battery), 1);
+            g_overlayDrawing = false;
+            g_canvasGraphics = nullptr;
+            g_canvas = nullptr;
+        }
+    }
+    return image;
+}
+
+static void SendOverlay() {
+    g_overlayPending = false;
+    if (!g_spout) return;
+    gp::Bitmap* image = RenderOverlay();
+    gp::Rect all(0, 0, kOverlayW, kOverlayH);
+    gp::BitmapData data;
+    if (image->LockBits(&all, gp::ImageLockModeRead, PixelFormat32bppPARGB, &data) != gp::Ok) return;
+    // to straight alpha, which is what receivers take a BGRA sender's pixels as
+    static std::vector<BYTE> pixels(kOverlayW * kOverlayH * 4);
+    static int unpremultiply[256];          // 65536 / alpha
+    if (!unpremultiply[1]) for (int a = 1; a < 256; a++) unpremultiply[a] = (255 * 65536 + a / 2) / a;
+    for (int y = 0; y < kOverlayH; y++) {
+        const BYTE* in = (const BYTE*)data.Scan0 + y * data.Stride;
+        BYTE* out = pixels.data() + y * kOverlayW * 4;
+        for (int x = 0; x < kOverlayW; x++, in += 4, out += 4) {
+            BYTE a = in[3];
+            if (a == 255) { *(DWORD*)out = *(const DWORD*)in; continue; }
+            if (a == 0) { *(DWORD*)out = 0; continue; }
+            int k = unpremultiply[a];
+            out[0] = (BYTE)min(255, (in[0] * k + 32768) >> 16);
+            out[1] = (BYTE)min(255, (in[1] * k + 32768) >> 16);
+            out[2] = (BYTE)min(255, (in[2] * k + 32768) >> 16);
+            out[3] = a;
+        }
+    }
+    image->UnlockBits(&data);
+    g_spout->SendImage(pixels.data(), kOverlayW, kOverlayH);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!g_overlayFrames++) g_overlayFirst = now.QuadPart;
+}
+
+static void ApplySpout() {
+    if (g_spoutOn && !g_spout && (!g_noInput || g_testSpout)) {
+        g_spout = new spoutDX;
+        if (!g_spout->OpenDirectX11()) { delete g_spout; g_spout = nullptr; return; }
+        g_spout->SetSenderName("DS4-Native");
+        g_overlayStop = false;
+        g_overlayPending = false;
+        g_overlayClock = CreateThread(nullptr, 0, OverlayClock, nullptr, 0, nullptr);
+    } else if (!g_spoutOn && g_spout) {
+        g_overlayStop = true;
+        if (g_overlayClock) { WaitForSingleObject(g_overlayClock, 1000); CloseHandle(g_overlayClock); g_overlayClock = nullptr; }
+        g_spout->ReleaseSender();
+        g_spout->CloseDirectX11();
+        delete g_spout;
+        g_spout = nullptr;
+    }
+}
+
 static void Refresh() {
+    UpdateTaskbarBattery(false);            // (also while the window is minimised and not painting)
     SelectedPad();
     SyncHiding();
     for (Pad* p : g_pads) {
@@ -4847,6 +5313,8 @@ static void ShowTrayMenu(HWND hwnd) {
 }
 
 static void SelfTestFinish();
+static gp::Bitmap* RenderOverlay();
+static double g_overlayMs;                  // self-test: the overlay's render time
 
 static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -4859,6 +5327,9 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (Pad* p : g_pads) if (p->ready) g_selected = p;
         }
         Refresh();
+        return 0;
+    case WM_OVERLAY:                        // the stream overlay's next frame
+        SendOverlay();
         return 0;
     case WM_VOLUME: {
         wchar_t text[48];
@@ -4893,6 +5364,7 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 3) KillTimer(hwnd, 3);    // device change, settled
         if (wp == 4) { SelfTestFinish(); return 0; }
+
         if (!hidhide::g_ready && wp == 2) hidhide::WhitelistSelf();
         if (g_chromaState == CHROMA_STARTING && GetTickCount64() - g_chromaStart > 15000) g_chromaState = CHROMA_HUNG;
         ScanPads();
@@ -4957,6 +5429,9 @@ static void AddDemoPad() {
 }
 
 static void SelfTestFinish() {
+    LARGE_INTEGER sentAt;                   // the overlay's frame rate, before the timings below hold it up
+    QueryPerformanceCounter(&sentAt);
+    LONGLONG sentFrames = g_overlayFrames;
     RECT rc;
     GetClientRect(g_window, &rc);
     HDC screen = GetDC(nullptr);
@@ -4973,6 +5448,11 @@ static void SelfTestFinish() {
         gp::Bitmap image(bmp, nullptr);
         CLSID png = { 0x557CF406, 0x1A04, 0x11D3, { 0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E } };
         image.Save((g_selfTest + L"\\shot.png").c_str(), &png);
+        QueryPerformanceCounter(&t0);
+        for (int i = 0; i < 40; i++) RenderOverlay();            // the stream overlay's frame too
+        QueryPerformanceCounter(&t1);
+        g_overlayMs = (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart / 40;
+        RenderOverlay()->Save((g_selfTest + L"\\overlay.png").c_str(), &png);
     }
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -4996,7 +5476,23 @@ static void SelfTestFinish() {
     }
     wchar_t timing[128];
     swprintf_s(timing, L"\nPaint: %.1f ms a frame (3D model %.1f ms, big glow %.1f ms)\n", frame, model, glow);
-    std::wstring status = StatusText() + timing;
+    std::wstring status = StatusText() + timing + g_taskbarNote;
+    if (g_spout) {                          // what a receiver would see
+        char name[256];
+        unsigned int sw = 0, sh = 0;
+        HANDLE share = nullptr;
+        DWORD format = 0;
+        bool found = g_spout->GetSenderInfo("DS4-Native", sw, sh, share, format);
+        wchar_t line[300];
+        QueryPerformanceCounter(&t1);
+        double sentFor = (sentAt.QuadPart - g_overlayFirst) / (double)f.QuadPart;
+        swprintf_s(line, L"Spout: %d sender(s), DS4-Native %s, %ux%u, format %lu, render %.1f ms, %lld frames in %.2f s = %.1f fps\n",
+                   g_spout->GetSenderCount(),
+                   found ? L"listed" : L"MISSING", sw, sh, format, g_overlayMs, sentFrames, sentFor, sentFrames > 1 ? (sentFrames - 1) / sentFor : 0.0);
+        status += line;
+        for (int i = 0; i < g_spout->GetSenderCount(); i++)
+            if (g_spout->GetSender(i, name)) { status += L"  - "; status += std::wstring(name, name + strlen(name)); status += L"\n"; }
+    }
     if (g_testMic) {
         AcquireSRWLockShared(&g_dumpLock);
         status += L"\r\n" + std::wstring(g_dump.begin(), g_dump.end());
@@ -5063,6 +5559,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     bool demo = GetEnvironmentVariableW(L"DS4NATIVE_DEMO", env, MAX_PATH) != 0;
     g_testMic = micout::g_dry = selfTest && GetEnvironmentVariableW(L"DS4NATIVE_MICDRY", env, MAX_PATH) != 0;
     g_noInput = selfTest;
+    if (selfTest && GetEnvironmentVariableW(L"DS4NATIVE_SPOUT", env, MAX_PATH)) g_testSpout = true;
     if (selfTest) SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 
     g_single = CreateMutexW(nullptr, TRUE, selfTest ? L"Local\\DS4Native.SelfTest" : L"Local\\DS4Native.Tray");
@@ -5080,13 +5577,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     ULONG_PTR gdiplusToken;
     gp::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr);
     CreateFonts();
+    LoadAccentColour();
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);     // listing sound devices
     if (!selfTest) MigrateOldSettings();
     LoadGlobals();
+    if (g_testSpout) g_spoutOn = true;          // (not saved)
     LoadShortcuts();
-    audio::LoadSource();
-    micout::LoadDest();
+    if (!demo) audio::LoadSource();
+    if (!demo) micout::LoadDest();
     hidhide::LoadOurs();
     if (!demo) hidhide::WhitelistSelf();    // before opening any controller: it may be hidden already
     else hidhide::g_ready = hidhide::Installed();   // the demo touches nothing, but shows the switch as it would be
@@ -5135,10 +5634,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         if (GetEnvironmentVariableW(L"DS4NATIVE_PANEL", env, MAX_PATH)) { g_panelOpen = true; g_actionMenuRow = _wtoi(env) - 1; }
         if (demo && GetEnvironmentVariableW(L"DS4NATIVE_LIGHT", env, MAX_PATH)) g_pads.back()->set[S_LIGHTMODE] = _wtoi(env);
         if (GetEnvironmentVariableW(L"DS4NATIVE_TAB", env, MAX_PATH)) g_leftTab = _wtoi(env);
-        if (demo && g_leftTab) { g_pads.back()->set[S_TPMOUSE] = 1; g_pads.back()->set[S_AUDIO] = 1; }
+        if (demo && g_leftTab == 1) g_pads.back()->set[S_TPMOUSE] = 1;
+        if (GetEnvironmentVariableW(L"DS4NATIVE_TASKBAR", env, MAX_PATH))   // a taskbar button, minimised, focus left alone
+            ShowWindow(g_window, SW_SHOWMINNOACTIVE);
+        if (demo && g_leftTab == 2) {      // the Sound tab as it looks in use
+            Pad* d = g_pads.back();
+            d->set[S_AUDIO] = 1; d->set[S_TPMOUSE] = 0; d->set[S_TPVOLUME] = 1; d->set[S_MIC] = 1;
+            d->state.mic = d->state.phones = true;
+        }
     }
     Refresh();
     if (!demo) SetTimer(g_tray, 2, 3000, nullptr);     // rescan: retries and anything the notifications missed
+    ApplySpout();                                       // the stream overlay, if it was left on
     if (selfTest) {
         UINT ms = 3000;
         if (GetEnvironmentVariableW(L"DS4NATIVE_SECONDS", env, MAX_PATH)) ms = (UINT)(_wtof(env) * 1000);
@@ -5162,6 +5669,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
     SyncHiding();
     StopChroma();
+    g_spoutOn = false;
+    ApplySpout();
     audio::Want(false);
     micout::Want(false);
     if (g_vigem) {

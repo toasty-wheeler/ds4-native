@@ -6,3 +6,5 @@
 app/obj/
 dist/
 setup/redist/
+app/DS4Native.lib
+app/DS4Native.exp

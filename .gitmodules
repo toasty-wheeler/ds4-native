@@ -1,3 +1,6 @@
 [submodule "third_party/ViGEmClient"]
 	path = third_party/ViGEmClient
 	url = https://github.com/nefarius/ViGEmClient.git
+[submodule "third_party/Spout2"]
+	path = third_party/Spout2
+	url = https://github.com/leadedge/Spout2.git

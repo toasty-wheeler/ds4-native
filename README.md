@@ -21,6 +21,11 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
 - Stick and trigger dead zones; PS presses Guide.
 - DualShock 4 v1 and v2, over Bluetooth, USB or Sony's wireless adapter; several at once, each with
   its own tab and its own settings (remembered per controller).
+- Other controllers too: any generic USB or Bluetooth HID gamepad (8BitDo pads in DirectInput
+  mode, USB pads, ...) gets its own tab, a live view, and can be an Xbox controller and hidden the
+  same way (8BitDo pads use their known button layout; others a common one). The DualShock-only
+  features (light bar, touchpad, sound, motion, battery) are off for them. Xbox-type pads are left
+  alone, since games support them already.
 
 **The window**
 - Tabs along the top, one per connected controller, with its light-bar colour and battery.
@@ -35,20 +40,26 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
 - Battery, with an estimate of how long it will last (learned from how fast your controller drains),
   and a signal bar for Bluetooth: Windows doesn't report a classic Bluetooth device's signal
   strength, so it shows the share of the controller's reports that actually arrive.
+- The window's taskbar button shows the selected controller's battery as its progress bar: green,
+  yellow under 35 %, red under 15 %.
 - Light and dark themes (or follow Windows), always-on-top, start with Windows.
 
 **Light bar**
+
+![Light bar](docs/lightbar.png)
+
 - Battery colour, any colour you pick, a rainbow with adjustable speed, Razer Chroma, or off; with
   brightness.
 - **Razer Chroma**: the light bar follows your Razer Synapse effects through Chroma Connect; see
   [Razer Chroma](#razer-chroma).
 
-**Touchpad as a mouse** (switch it on with the mouse button in the header)
+**Touchpad as a mouse** (switch it on in the Touchpad tab)
 
 ![Touchpad](docs/touchpad.png)
 - One finger moves the cursor, two fingers scroll, like a laptop touchpad.
-- Press the pad to click: the left half left-clicks and the right half right-clicks (or the whole
-  pad left-clicks); the preview splits the touchpad and lights the side being clicked. A press only counts if the finger stays still, so sliding around never clicks.
+- Pressing the pad is the mouse button: down while it's pressed, so press and slide to drag or
+  select. The left half left-clicks and the right half right-clicks (or the whole pad
+  left-clicks); the preview splits the touchpad and lights the side being clicked.
 - Two fingers: right or middle click. Optional tap to click.
 - Cursor speed setting. The cursor is placed directly, so Windows' pointer acceleration doesn't
   make the speed uneven.
@@ -89,6 +100,12 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
 - **Touchpad volume**: with the touchpad mouse off, the touchpad can be Windows' volume slider:
   slide right or up for louder, left or down for quieter (two fingers twice as fast), and press it
   to mute or unmute.
+- **Stream overlay**: the live controller preview, ambilight included, on a transparent
+  background as a [Spout2](https://spout.zeal.co/) source named "DS4-Native" (800Ã—560), for OBS
+  and other streaming or VJ software, at 60 fps. Turn on "Stream overlay" at the bottom of the window. It keeps
+  going with the window closed and shows the selected tab's controller. In OBS, install the free
+  [Spout2 plugin for OBS](https://github.com/Off-World-Live/obs-spout2-plugin), add a
+  "Spout2 Capture" source and pick DS4-Native.
 
 ## Install
 
@@ -161,6 +178,12 @@ misbehaves. App IDs are requested from Razer through the
   address).
 - **Driver status** in the window lists ViGEmBus, HidHide, Chroma and each controller's connection,
   motion data, link quality and sound statistics.
+- **Mouse buttons stuck or reversed, or the controller doing two things at once:** another program
+  (usually Steam, whose desktop layout also turns the touchpad into a mouse) opened the controller
+  before DS4-Native hid it. Hidden controllers now stay hidden while DS4-Native runs, connected or
+  not, so this can only happen if that program already had it open: restart Steam, or turn the
+  controller off and on, once. Steam can also be kept away from PlayStation controllers entirely
+  with Settings > Controller > "Enable Steam Input for PlayStation controllers" off.
 
 ## Status
 
@@ -171,4 +194,5 @@ by the code but haven't been tried on hardware yet. Bluetooth sound is experimen
 
 [ViGEmBus, ViGEmClient and HidHide](https://github.com/nefarius) by Nefarius; the SBC encoder and
 the Bluetooth sound report layout come from [DS4-Sound-Link](https://github.com/abh1shekbana/DS4-Sound-Link)
-(MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+(MIT); the stream overlay is sent with [Spout2](https://github.com/leadedge/Spout2) by Lynn Jarvis
+(BSD 2-Clause). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
