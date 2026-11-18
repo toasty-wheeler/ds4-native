@@ -3331,6 +3331,32 @@ static float g_split;                   // the touchpad's split line (left / rig
 
 static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::Color light, float opacity) {
     const Palette& p = Pal();
+    if (opacity < 1) {                      // (not emulating, or no controller): see-through
+        gp::RectF all = L.R(-40, -60, 1080, 740);
+        int lw = (int)ceilf(all.Width), lh = (int)ceilf(all.Height);
+        static gp::Bitmap* layer;
+        if (!layer || (int)layer->GetWidth() < lw || (int)layer->GetHeight() < lh) {
+            delete layer;
+            layer = new gp::Bitmap(lw, lh, PixelFormat32bppPARGB);
+        }
+        {
+            gp::Graphics lg(layer);
+            lg.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+            lg.SetTextRenderingHint(gp::TextRenderingHintAntiAliasGridFit);
+            lg.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+            lg.Clear(gp::Color(0, 0, 0, 0));
+            lg.TranslateTransform(-floorf(all.X), -floorf(all.Y));
+            DrawPad(lg, L, s, light, 1);
+        }
+        gp::ColorMatrix fade = { { { 1, 0, 0, 0, 0 }, { 0, 1, 0, 0, 0 }, { 0, 0, 1, 0, 0 }, { 0, 0, 0, opacity, 0 }, { 0, 0, 0, 0, 1 } } };
+        gp::ImageAttributes attributes;
+        attributes.SetColorMatrix(&fade);
+        gp::GraphicsState saved = g.Save();
+        g.SetPixelOffsetMode(gp::PixelOffsetModeNone);   // 1:1, no resampling
+        g.DrawImage(layer, gp::Rect((int)floorf(all.X), (int)floorf(all.Y), lw, lh), 0, 0, lw, lh, gp::UnitPixel, &attributes);
+        g.Restore(saved);
+        return;
+    }
     gp::Color control = Mix(p.body, p.text, 0.10f);
     DWORD b = s.buttons;
 
@@ -3415,12 +3441,6 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
 
     DrawStick(g, L, 352, 390, s.lx, s.ly, (b & B_L3) != 0);
     DrawStick(g, L, 648, 390, s.rx, s.ry, (b & B_R3) != 0);
-
-    if (opacity < 1) {                      // no controller: wash the drawing out
-        gp::RectF all = L.R(0, 0, 1000, 640);
-        gp::SolidBrush wash(WithAlpha(p.bg, (int)(255 * (1 - opacity))));
-        g.FillRectangle(&wash, all);
-    }
 }
 
 // ---- ambilight: as on the Magic Mouse app, a pressed button or a finger on the touchpad lights
@@ -3432,8 +3452,8 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
 // light the cells, and the field is blended into the window, smoothly interpolated.
 
 static const int   kAmbientStep = 4;
-static const float kAmbientReach = 80;          // 96-dpi px outside the outline to fall to 1/e
-static const float kAmbientSpread = 190;        // design units along the outline (1 sigma)
+static const float kAmbientReach = 160;         // 96-dpi px outside the outline to fall to 1/e
+static const float kAmbientSpread = 380;        // design units along the outline (1 sigma)
 
 enum { GLOW_CONTRAST, GLOW_ACCENT, GLOW_TRIANGLE, GLOW_CIRCLE, GLOW_CROSS, GLOW_SQUARE };
 static const struct { DWORD bit; float u, v; int colour; int analog; } kGlowSpots[] = {
@@ -5171,10 +5191,10 @@ static void UpdateTray(HWND hwnd, DWORD action) {
 // background, sent 60 times a second as a Spout2 sender ("DS4-Native") that OBS (with the
 // Spout2 plugin) and other programs can take in. Keeps going with the window closed.
 
-// The overlay's glow reaches 1.5 times as far as the window's (in proportion to the controller),
-// and the frame holds all of it: the field runs 3 reaches past the controller on every side.
-static const int kOverlayW = 1280, kOverlayH = 1104;
-static const float kOverlayReach = 270;     // design units (the window's is about 180)
+// The overlay's glow reaches as far as the window's (in proportion to the controller), and the
+// frame holds all of it: the field runs 3 reaches past the controller on every side.
+static const int kOverlayW = 1440, kOverlayH = 1260;
+static const float kOverlayReach = 360;     // design units (the window's is about the same)
 static const UINT WM_OVERLAY = WM_APP + 6;  // time for the next overlay frame (from the pacing thread)
 static spoutDX* g_spout;
 static HANDLE g_overlayClock;               // the pacing thread
@@ -5231,7 +5251,7 @@ static gp::Bitmap* RenderOverlay() {
             g_overlayDrawing = true;
             static AmbientField overlayField;
             overlayField.reachPx = kOverlayReach * L.scale;
-            overlayField.spread = 1.5f;
+
             DrawAmbient(og, L, (float)kOverlayW, (float)kOverlayH, overlayField);
             DrawPad(og, L, s, PadLight(pad, s.battery), 1);
             g_overlayDrawing = false;
@@ -5646,6 +5666,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         if (GetEnvironmentVariableW(L"DS4NATIVE_PANEL", env, MAX_PATH)) { g_panelOpen = true; g_actionMenuRow = _wtoi(env) - 1; }
         if (demo && GetEnvironmentVariableW(L"DS4NATIVE_LIGHT", env, MAX_PATH)) g_pads.back()->set[S_LIGHTMODE] = _wtoi(env);
         if (GetEnvironmentVariableW(L"DS4NATIVE_TAB", env, MAX_PATH)) g_leftTab = _wtoi(env);
+        if (GetEnvironmentVariableW(L"DS4NATIVE_PAUSED", env, MAX_PATH)) g_enabled = false;   // the see-through controller
         if (demo && g_leftTab == 1) g_pads.back()->set[S_TPMOUSE] = 1;
         if (GetEnvironmentVariableW(L"DS4NATIVE_TASKBAR", env, MAX_PATH))   // a taskbar button, minimised, focus left alone
             ShowWindow(g_window, SW_SHOWMINNOACTIVE);
