@@ -62,7 +62,7 @@
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 static const wchar_t kAppName[] = L"DS4-Native";
-static const wchar_t kVersion[] = L"1.2.1";
+static const wchar_t kVersion[] = L"1.2.2";
 static const wchar_t kRegKey[]  = L"Software\\DS4Native";
 static const wchar_t kRunKey[]  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const UINT WM_TRAY     = WM_APP + 1;

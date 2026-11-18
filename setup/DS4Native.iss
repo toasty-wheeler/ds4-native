@@ -5,7 +5,7 @@
 ; Both are Nefarius' own signed installers, run silently, and only when not installed already.
 
 #ifndef AppVer
-  #define AppVer "1.2.1"
+  #define AppVer "1.2.2"
 #endif
 #define ViGEmSetup "ViGEmBus_1.22.0_x64_x86_arm64.exe"
 #define HidHideSetup "HidHide_1.5.230_x64.exe"
@@ -39,7 +39,7 @@ Name: startup; Description: "Start DS4-Native with Windows"; Flags: unchecked
 Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
-Source: "..\app\DS4Native.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\build\DS4Native.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "redist\{#ViGEmSetup}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: not ViGEmInstalled

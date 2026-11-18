@@ -4,8 +4,10 @@ rem Needs Inno Setup 6 (iscc on PATH) and the GitHub CLI (gh) to fetch the bundl
 setlocal
 set NoDefaultCurrentDirectoryInExePath=
 cd /d "%~dp0"
-set VER=1.2.1
-call ..\app\build.bat || exit /b 1
+set VER=1.2.2
+rem The release exe is built into dist\build, so a copy running from app\ doesn't get in the way.
+if not exist ..\dist\build mkdir ..\dist\build
+call ..\app\build.bat ..\dist\build\DS4Native.exe || exit /b 1
 cd /d "%~dp0"
 
 if not exist redist mkdir redist
@@ -21,7 +23,7 @@ iscc /Q /DAppVer=%VER% DS4Native.iss || exit /b 1
 set PORTABLE=..\dist\DS4-Native-%VER%-portable
 if exist "%PORTABLE%" rmdir /s /q "%PORTABLE%"
 mkdir "%PORTABLE%"
-copy /y ..\app\DS4Native.exe "%PORTABLE%" >nul
+copy /y ..\dist\build\DS4Native.exe "%PORTABLE%" >nul
 copy /y ..\README.md "%PORTABLE%" >nul
 copy /y ..\THIRD_PARTY_NOTICES.md "%PORTABLE%" >nul
 if exist "%PORTABLE%.zip" del "%PORTABLE%.zip"

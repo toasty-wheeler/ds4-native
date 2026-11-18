@@ -22,8 +22,9 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
 - DualShock 4 v1 and v2, over Bluetooth, USB or Sony's wireless adapter; several at once, each with
   its own tab and its own settings (remembered per controller).
 - Other controllers too: any generic USB or Bluetooth HID gamepad (8BitDo pads in DirectInput
-  mode, USB pads, ...) gets its own tab, a live view, and can be an Xbox controller and hidden the
-  same way (8BitDo pads use their known button layout; others a common one). The DualShock-only
+  mode, USB pads, ...) gets its own tab, a live view drawn as a generic gamepad with the Xbox layout
+  (A/B/X/Y, LB/RB/LT/RT), and can be an Xbox controller and hidden the same way (8BitDo pads use
+  their known button layout; others a common one). The DualShock-only
   features (light bar, touchpad, sound, motion, battery) are off for them. Xbox-type pads are left
   alone, since games support them already.
 
