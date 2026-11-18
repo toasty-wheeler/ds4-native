@@ -2942,10 +2942,10 @@ static bool BlendGlow(float cx, float cy, float rx, float ry, gp::Color c) {
             if (d2 >= 1) continue;
             float a = alpha * (1 - sqrtf(d2)), keep = 1 - a;
             BYTE* px = row + (x - x0) * 4;     // B G R A, premultiplied
-            px[0] = (BYTE)(b * a + px[0] * keep);
-            px[1] = (BYTE)(gr * a + px[1] * keep);
-            px[2] = (BYTE)(r * a + px[2] * keep);
-            px[3] = (BYTE)(255 * a + px[3] * keep);
+            px[0] = (BYTE)(b * a + px[0] * keep + 0.5f);
+            px[1] = (BYTE)(gr * a + px[1] * keep + 0.5f);
+            px[2] = (BYTE)(r * a + px[2] * keep + 0.5f);
+            px[3] = (BYTE)(255 * a + px[3] * keep + 0.5f);
         }
     }
     g_canvas->UnlockBits(&data);
@@ -3514,7 +3514,9 @@ static bool AmbientActive() {
 }
 
 struct AmbientField {
-    float x0 = -1, y0, scale;           // the layout it was made for
+    float reachPx = 0;                  // how far the glow reaches out (px; 0: the window's)
+    float spread = 1;                   // how wide each light is, times the window's
+    float x0 = -1, y0, scale, reach;    // the layout (and reach) it was made for
     int ox, oy, cols, rows;             // the field's place in the window (px) and size (cells)
     std::vector<float> fade;            // exp(-distance outside the outline / reach)
 };
@@ -3522,9 +3524,9 @@ struct AmbientField {
 static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, AmbientField& F) {
     if (!AmbientActive() || !g_canvas || &g != g_canvasGraphics) return;
 
-    float reach = S(kAmbientReach);
-    if (F.x0 != L.x0 || F.y0 != L.y0 || F.scale != L.scale) {
-        F.x0 = L.x0; F.y0 = L.y0; F.scale = L.scale;
+    float reach = F.reachPx > 0 ? F.reachPx : S(kAmbientReach);
+    if (F.x0 != L.x0 || F.y0 != L.y0 || F.scale != L.scale || F.reach != reach) {
+        F.x0 = L.x0; F.y0 = L.y0; F.scale = L.scale; F.reach = reach;
         gp::GraphicsPath path;
         PadBodyPath(path, L);
         path.Flatten(nullptr, 0.5f);
@@ -3551,7 +3553,10 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
                     float cx = a.X + ex * t, cy = a.Y + ey * t;
                     best = min(best, (px - cx) * (px - cx) + (py - cy) * (py - cy));
                 }
-                F.fade[r * F.cols + c] = inside ? 1.0f : expf(-sqrtf(best) / reach);
+                // exp(-distance / reach), lowered to reach 0 exactly at the field's edge (3 reaches
+                // out), so the glow never ends in a visible edge
+                static const float kEdge = expf(-3.0f);
+                F.fade[r * F.cols + c] = inside ? 1.0f : max(0.0f, (expf(-sqrtf(best) / reach) - kEdge) / (1 - kEdge));
             }
         }
     }
@@ -3577,7 +3582,7 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
     cr.assign(cells, 0); cg.assign(cells, 0); cb.assign(cells, 0); ca.assign(cells, 0);
     // Each source lights cells by their own distance from it (smooth everywhere), and the
     // outline's fade keeps the light hugging the edge.
-    float sigma = L.U(kAmbientSpread), twoSigma2 = 2 * sigma * sigma;
+    float sigma = L.U(kAmbientSpread) * F.spread, twoSigma2 = 2 * sigma * sigma;
     float seconds = (GetTickCount64() % 1000000) / 1000.0f, ring;
     if (g_ringStyle == RING_CHARGING)       // a slow breath, about every 3 s
         ring = g_ringLevel * (0.08f + 0.62f * (0.5f - 0.5f * cosf(seconds * 2 * kPi / 3.0f)));
@@ -3619,27 +3624,25 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
             size_t k = (size_t)row * F.cols + col;
             float a00 = ca[k], a01 = ca[k + 1], a10 = ca[k + F.cols], a11 = ca[k + F.cols + 1];
             if (a00 + a01 + a10 + a11 < 0.004f) continue;
+            size_t k1 = k + 1, k2 = k + F.cols, k3 = k + F.cols + 1;
+            int xs = F.ox + col * kAmbientStep, xn = min(kAmbientStep, x1 - xs);
             for (int yy = 0; yy < kAmbientStep; yy++) {
                 int y = F.oy + row * kAmbientStep + yy;
                 if (y >= y1) break;
-                BYTE* line = (BYTE*)data.Scan0 + (y - F.oy) * data.Stride;
+                BYTE* px = (BYTE*)data.Scan0 + (y - F.oy) * data.Stride + (xs - F.ox) * 4;
                 float ty = yy * inv;
-                for (int xx = 0; xx < kAmbientStep; xx++) {
-                    int x = F.ox + col * kAmbientStep + xx;
-                    if (x >= x1) break;
-                    float tx = xx * inv;
-                    float w00 = (1 - tx) * (1 - ty), w01 = tx * (1 - ty), w10 = (1 - tx) * ty, w11 = tx * ty;
-                    float a = a00 * w00 + a01 * w01 + a10 * w10 + a11 * w11;
+                // this line's ends (left and right cell corners), then a step per pixel
+                float a = a00 + (a10 - a00) * ty, r = cr[k] + (cr[k2] - cr[k]) * ty;
+                float gr = cg[k] + (cg[k2] - cg[k]) * ty, b = cb[k] + (cb[k2] - cb[k]) * ty;
+                float da = (a01 + (a11 - a01) * ty - a) * inv, dr = (cr[k1] + (cr[k3] - cr[k1]) * ty - r) * inv;
+                float dg = (cg[k1] + (cg[k3] - cg[k1]) * ty - gr) * inv, db = (cb[k1] + (cb[k3] - cb[k1]) * ty - b) * inv;
+                for (int xx = 0; xx < xn; xx++, px += 4, a += da, r += dr, gr += dg, b += db) {
                     if (a < 0.002f) continue;
-                    float r = cr[k] * w00 + cr[k + 1] * w01 + cr[k + F.cols] * w10 + cr[k + F.cols + 1] * w11;
-                    float gr = cg[k] * w00 + cg[k + 1] * w01 + cg[k + F.cols] * w10 + cg[k + F.cols + 1] * w11;
-                    float b = cb[k] * w00 + cb[k + 1] * w01 + cb[k + F.cols] * w10 + cb[k + F.cols + 1] * w11;
-                    BYTE* px = line + (x - F.ox) * 4;
                     float keep = 1 - a;
-                    px[0] = (BYTE)min(255.0f, b + px[0] * keep);
-                    px[1] = (BYTE)min(255.0f, gr + px[1] * keep);
-                    px[2] = (BYTE)min(255.0f, r + px[2] * keep);
-                    px[3] = (BYTE)min(255.0f, 255 * a + px[3] * keep);
+                    px[0] = (BYTE)min(255.0f, b + px[0] * keep + 0.5f);     // rounded: truncating darkens faint glow
+                    px[1] = (BYTE)min(255.0f, gr + px[1] * keep + 0.5f);
+                    px[2] = (BYTE)min(255.0f, r + px[2] * keep + 0.5f);
+                    px[3] = (BYTE)min(255.0f, 255 * a + px[3] * keep + 0.5f);
                 }
             }
         }
@@ -5168,7 +5171,10 @@ static void UpdateTray(HWND hwnd, DWORD action) {
 // background, sent 60 times a second as a Spout2 sender ("DS4-Native") that OBS (with the
 // Spout2 plugin) and other programs can take in. Keeps going with the window closed.
 
-static const int kOverlayW = 800, kOverlayH = 560;
+// The overlay's glow reaches 1.5 times as far as the window's (in proportion to the controller),
+// and the frame holds all of it: the field runs 3 reaches past the controller on every side.
+static const int kOverlayW = 1280, kOverlayH = 1104;
+static const float kOverlayReach = 270;     // design units (the window's is about 180)
 static const UINT WM_OVERLAY = WM_APP + 6;  // time for the next overlay frame (from the pacing thread)
 static spoutDX* g_spout;
 static HANDLE g_overlayClock;               // the pacing thread
@@ -5216,11 +5222,16 @@ static gp::Bitmap* RenderOverlay() {
                 g_split += (splitGoal - g_split) * 0.18f;
                 if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
             }
-            PadLayout L = LayoutPad(gp::RectF(40, 60, kOverlayW - 80.0f, kOverlayH - 100.0f));
+            PadLayout L;
+            L.scale = min(kOverlayW / (1000 + 6 * kOverlayReach), kOverlayH / (640 + 6 * kOverlayReach));
+            L.x0 = (kOverlayW - 1000 * L.scale) / 2;
+            L.y0 = (kOverlayH - 640 * L.scale) / 2;
             g_canvas = image;                   // glows and the ambilight blend straight into it
             g_canvasGraphics = &og;
             g_overlayDrawing = true;
             static AmbientField overlayField;
+            overlayField.reachPx = kOverlayReach * L.scale;
+            overlayField.spread = 1.5f;
             DrawAmbient(og, L, (float)kOverlayW, (float)kOverlayH, overlayField);
             DrawPad(og, L, s, PadLight(pad, s.battery), 1);
             g_overlayDrawing = false;
@@ -5417,6 +5428,7 @@ static void AddDemoPad() {
     p->state.battery = 62;
     wchar_t level[16];
     if (GetEnvironmentVariableW(L"DS4NATIVE_BATTERY", level, 16)) p->state.battery = _wtoi(level);
+    if (GetEnvironmentVariableW(L"DS4NATIVE_CHARGING", level, 16)) p->state.charging = true;
     p->state.imu = true;
     float dq[4] = { 0.96f, 0.12f, 0.18f, -0.1f }, dn = sqrtf(dq[0] * dq[0] + dq[1] * dq[1] + dq[2] * dq[2] + dq[3] * dq[3]);
     for (int i = 0; i < 4; i++) p->state.q[i] = dq[i] / dn;

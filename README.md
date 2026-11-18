@@ -101,7 +101,7 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
   slide right or up for louder, left or down for quieter (two fingers twice as fast), and press it
   to mute or unmute.
 - **Stream overlay**: the live controller preview, ambilight included, on a transparent
-  background as a [Spout2](https://spout.zeal.co/) source named "DS4-Native" (800Ã—560), for OBS
+  background as a [Spout2](https://spout.zeal.co/) source named "DS4-Native" (1280×1104, with room for the glow to fade out), for OBS
   and other streaming or VJ software, at 60 fps. Turn on "Stream overlay" at the bottom of the window. It keeps
   going with the window closed and shows the selected tab's controller. In OBS, install the free
   [Spout2 plugin for OBS](https://github.com/Off-World-Live/obs-spout2-plugin), add a
