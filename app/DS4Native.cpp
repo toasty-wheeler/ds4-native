@@ -3488,7 +3488,16 @@ static gp::Color GlowColour(int which) {
 // Eases each light towards its button (quick in, slow out) and follows the fingers.
 static bool g_touchSplit, g_touchRight;    // split clicks on, and which side the click is on
 
+// Whether the ambilight changed in its last update (or the ring is breathing): a steady glow,
+// like a button held down, needs no repainting.
+static bool g_ambientMoving = true;
+
 static void UpdateAmbient(const PadState& s, bool live) {
+    float before[ARRAYSIZE(kGlowSpots) + 7];
+    int n = 0;
+    for (float level : g_spotLevel) before[n++] = level;
+    for (int i = 0; i < 2; i++) { before[n++] = g_fingerLevel[i]; before[n++] = g_fingerU[i]; before[n++] = g_fingerV[i]; }
+    before[n++] = g_ringLevel;
     g_touchSplit = g_split > 0.5f;
     if (s.buttons & B_TOUCH) {
         int finger = s.touch[0] ? 0 : 1;
@@ -3505,12 +3514,14 @@ static void UpdateAmbient(const PadState& s, bool live) {
     }
     g_ringLevel += ((charging || low ? 1.0f : 0.0f) - g_ringLevel) * 0.08f;
     if (g_ringLevel < 0.01f) g_ringLevel = 0;
+    if (g_ringLevel > 0.996f) g_ringLevel = 1;
     for (int i = 0; i < (int)ARRAYSIZE(kGlowSpots); i++) {
         const auto& spot = kGlowSpots[i];
         float target = !live ? 0 : spot.analog == 1 ? s.l2 / 255.0f : spot.analog == 2 ? s.r2 / 255.0f
                      : (s.buttons & spot.bit) ? 1.0f : 0.0f;
         float& level = g_spotLevel[i];
         level += (target - level) * (target > level ? 0.45f : 0.12f);
+        if (fabsf(target - level) < 0.004f) level = target;     // settled
         if (level < 0.01f) level = 0;
     }
     for (int i = 0; i < 2; i++) {
@@ -3521,11 +3532,24 @@ static void UpdateAmbient(const PadState& s, bool live) {
             g_fingerU[i] += (u - g_fingerU[i]) * 0.5f;
             g_fingerV[i] += (v - g_fingerV[i]) * 0.5f;
             g_fingerLevel[i] += (0.9f - g_fingerLevel[i]) * 0.35f;
+            if (fabsf(0.9f - g_fingerLevel[i]) < 0.004f) g_fingerLevel[i] = 0.9f;
+            if (fabsf(u - g_fingerU[i]) < 0.5f) g_fingerU[i] = u;
+            if (fabsf(v - g_fingerV[i]) < 0.5f) g_fingerV[i] = v;
         } else {
             g_fingerLevel[i] *= 0.88f;
             if (g_fingerLevel[i] < 0.01f) g_fingerLevel[i] = 0;
         }
     }
+    n = 0;
+    bool changed = false;
+    for (float level : g_spotLevel) changed |= before[n++] != level;
+    for (int i = 0; i < 2; i++) {
+        changed |= before[n++] != g_fingerLevel[i];
+        changed |= before[n++] != g_fingerU[i];
+        changed |= before[n++] != g_fingerV[i];
+    }
+    changed |= before[n++] != g_ringLevel;
+    g_ambientMoving = changed || (g_ringLevel > 0 && g_ringStyle != RING_FULL);
 }
 
 static bool AmbientActive() {
@@ -3538,6 +3562,7 @@ struct AmbientField {
     float spread = 1;                   // how wide each light is, times the window's
     float x0 = -1, y0, scale, reach;    // the layout (and reach) it was made for
     int ox, oy, cols, rows;             // the field's place in the window (px) and size (cells)
+    int step = kAmbientStep;            // cell size (px): coarser for a wider glow, which is smooth anyway
     std::vector<float> fade;            // exp(-distance outside the outline / reach)
 };
 
@@ -3556,13 +3581,14 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
         int x0 = max(0, (int)(L.X(0) - margin)), x1 = min((int)w, (int)(L.X(1000) + margin));
         int y0 = max(0, (int)(L.Y(0) - margin)), y1 = min((int)h, (int)(L.Y(640) + margin));
         F.ox = x0; F.oy = y0;
-        F.cols = (x1 - x0) / kAmbientStep + 2;
-        F.rows = (y1 - y0) / kAmbientStep + 2;
+        F.step = max(kAmbientStep, (int)(reach / 10));
+        F.cols = (x1 - x0) / F.step + 2;
+        F.rows = (y1 - y0) / F.step + 2;
         F.fade.assign(F.cols * F.rows, 0);
         size_t n = pts.size();
         for (int r = 0; r < F.rows; r++) {
             for (int c = 0; c < F.cols; c++) {
-                float px = F.ox + c * kAmbientStep + 0.5f, py = F.oy + r * kAmbientStep + 0.5f;
+                float px = F.ox + c * F.step + 0.5f, py = F.oy + r * F.step + 0.5f;
                 float best = 1e30f;
                 bool inside = false;
                 for (size_t i = 0, j = n - 1; i < n; j = i++) {
@@ -3612,11 +3638,11 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
         ring = g_ringLevel * (0.55f + 0.25f * sinf(seconds * 2.2f));
     for (int i = 0; i < count; i++) { sources[i].u = L.X(sources[i].u); sources[i].v = L.Y(sources[i].v); }
     for (int row = 0; row < F.rows; row++) {
-        float py = F.oy + row * kAmbientStep + 0.5f;
+        float py = F.oy + row * F.step + 0.5f;
         for (int col = 0; col < F.cols; col++) {
             size_t k = (size_t)row * F.cols + col;
             if (F.fade[k] < 0.01f) continue;
-            float px = F.ox + col * kAmbientStep + 0.5f;
+            float px = F.ox + col * F.step + 0.5f;
             float sum = 0, r = 0, gr = 0, b = 0;
             for (int i = 0; i < count; i++) {
                 float dx = px - sources[i].u, dy = py - sources[i].v;
@@ -3631,23 +3657,23 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
             ca[k] = a; cr[k] = r / sum * a; cg[k] = gr / sum * a; cb[k] = b / sum * a;
         }
     }
-    // Blend into the window, a cell (kAmbientStep square) at a time; dark cells are skipped.
-    int x1 = min((int)g_canvas->GetWidth(), F.ox + (F.cols - 1) * kAmbientStep), y1 = min((int)g_canvas->GetHeight(), F.oy + (F.rows - 1) * kAmbientStep);
+    // Blend into the window, a cell (F.step square) at a time; dark cells are skipped.
+    int x1 = min((int)g_canvas->GetWidth(), F.ox + (F.cols - 1) * F.step), y1 = min((int)g_canvas->GetHeight(), F.oy + (F.rows - 1) * F.step);
     if (x1 <= F.ox || y1 <= F.oy) return;
     g_canvasGraphics->Flush(gp::FlushIntentionSync);
     gp::Rect area(F.ox, F.oy, x1 - F.ox, y1 - F.oy);
     gp::BitmapData data;
     if (g_canvas->LockBits(&area, gp::ImageLockModeRead | gp::ImageLockModeWrite, PixelFormat32bppPARGB, &data) != gp::Ok) return;
-    const float inv = 1.0f / kAmbientStep;
+    const float inv = 1.0f / F.step;
     for (int row = 0; row + 1 < F.rows; row++) {
         for (int col = 0; col + 1 < F.cols; col++) {
             size_t k = (size_t)row * F.cols + col;
             float a00 = ca[k], a01 = ca[k + 1], a10 = ca[k + F.cols], a11 = ca[k + F.cols + 1];
             if (a00 + a01 + a10 + a11 < 0.004f) continue;
             size_t k1 = k + 1, k2 = k + F.cols, k3 = k + F.cols + 1;
-            int xs = F.ox + col * kAmbientStep, xn = min(kAmbientStep, x1 - xs);
-            for (int yy = 0; yy < kAmbientStep; yy++) {
-                int y = F.oy + row * kAmbientStep + yy;
+            int xs = F.ox + col * F.step, xn = min(F.step, x1 - xs);
+            for (int yy = 0; yy < F.step; yy++) {
+                int y = F.oy + row * F.step + yy;
                 if (y >= y1) break;
                 BYTE* px = (BYTE*)data.Scan0 + (y - F.oy) * data.Stride + (xs - F.ox) * 4;
                 float ty = yy * inv;
@@ -3656,6 +3682,13 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
                 float gr = cg[k] + (cg[k2] - cg[k]) * ty, b = cb[k] + (cb[k2] - cb[k]) * ty;
                 float da = (a01 + (a11 - a01) * ty - a) * inv, dr = (cr[k1] + (cr[k3] - cr[k1]) * ty - r) * inv;
                 float dg = (cg[k1] + (cg[k3] - cg[k1]) * ty - gr) * inv, db = (cb[k1] + (cb[k3] - cb[k1]) * ty - b) * inv;
+                if (g_overlayDrawing) {     // the overlay draws it first, onto a cleared (transparent) frame: just write it
+                    auto byte = [](float v) { int i = (int)(v + 0.5f); return (BYTE)(i < 0 ? 0 : i > 255 ? 255 : i); };
+                    for (int xx = 0; xx < xn; xx++, px += 4, a += da, r += dr, gr += dg, b += db) {
+                        px[0] = byte(b); px[1] = byte(gr); px[2] = byte(r); px[3] = byte(255 * a);
+                    }
+                    continue;
+                }
                 for (int xx = 0; xx < xn; xx++, px += 4, a += da, r += dr, gr += dg, b += db) {
                     if (a < 0.002f) continue;
                     float keep = 1 - a;
@@ -4338,6 +4371,20 @@ static DWORD g_mapButtons;
 static Pad* g_mapPad;
 static unsigned g_paintedSeq;
 static Pad* g_paintedPad;
+static PadState g_paintedState;
+
+// Whether two states look the same in the window, motion aside (the motion sensors change with
+// every report, even with the controller lying still).
+static bool SameLook(const PadState& a, const PadState& b) {
+    if (a.lx != b.lx || a.ly != b.ly || a.rx != b.rx || a.ry != b.ry || a.l2 != b.l2 || a.r2 != b.r2) return false;
+    if (a.buttons != b.buttons || a.battery != b.battery || a.charging != b.charging) return false;
+    if (a.phones != b.phones || a.mic != b.mic || a.imu != b.imu) return false;
+    for (int i = 0; i < 2; i++) {
+        if (a.touch[i] != b.touch[i]) return false;
+        if (a.touch[i] && (a.tx[i] != b.tx[i] || a.ty[i] != b.ty[i])) return false;
+    }
+    return true;
+}
 static const ULONGLONG kMapShowMs = 1500, kSearchDotMs = 400;
 
 static void UpdateTaskbarBattery(bool force);
@@ -4377,6 +4424,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
             s = pad->state;
             ReleaseSRWLockShared(&pad->lock);
             g_paintedSeq = pad->seq;
+            g_paintedState = s;
         }
         g_paintedPad = pad;
         ULONGLONG now = GetTickCount64();
@@ -4919,22 +4967,34 @@ static int HitTest(LPARAM lp) {
 static ElemKind HitKind(int hit) { return hit >= 0 && hit < (int)g_elems.size() ? g_elems[hit].kind : E_TOGGLE; }
 
 // Whether the next frame would differ from the last one.
-static bool Animating() {
+// How soon the window needs painting again: what you do, the 3D motion and the switches at the
+// full 60 fps; slow glows and light-bar colours at 30; motion-sensor noise alone (motion
+// preview hidden) a few times a second, which keeps the text (signal, battery) current.
+enum { PAINT_NONE, PAINT_NOW, PAINT_SMOOTH, PAINT_LAZY };
+static int Animating() {
     Pad* pad = SelectedPad();
-    if (pad != g_paintedPad || !pad) return true;       // searching dots
-    if (pad->seq != g_paintedSeq) return true;
-    if (g_dragPad || g_viewReset || g_spinYaw || g_spinPitch || g_viewPitch || g_recording) return true;
+    if (pad != g_paintedPad || !pad) return PAINT_NOW;   // searching dots
+    if (g_dragPad || g_viewReset || g_spinYaw || g_spinPitch || g_viewPitch || g_recording) return PAINT_NOW;
     float splitGoal = pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
-    if (g_split != splitGoal) return true;
-    int mode = pad->set[S_LIGHTMODE];
-    if (mode == LIGHT_RAINBOW || mode == LIGHT_CHROMA) return true;
-    if (AmbientActive() || (g_leftTab == 2 && pad->audioOn)) return true;
+    if (g_split != splitGoal) return PAINT_NOW;
     ULONGLONG now = GetTickCount64();
-    if (now - g_mapTick < kMapShowMs + 100 || now < pad->testUntil + 100 || pad->rumbleStrong || pad->rumbleWeak) return true;
+    if (now - g_mapTick < kMapShowMs + 100 || now < pad->testUntil + 100 || pad->rumbleStrong || pad->rumbleWeak) return PAINT_NOW;
     for (int slot = 0; slot <= kSlotSpout; slot++) {
-        if (g_knob[slot] != (ToggleValue(slot) ? 1.0f : 0.0f)) return true;
+        if (g_knob[slot] != (ToggleValue(slot) ? 1.0f : 0.0f)) return PAINT_NOW;
     }
-    return false;
+    int need = PAINT_NONE;
+    if (pad->seq != g_paintedSeq) {
+        AcquireSRWLockShared(&pad->lock);
+        PadState s = pad->state;
+        ReleaseSRWLockShared(&pad->lock);
+        bool motion = !pad->generic && pad->set[S_MOTION] && s.imu;
+        if (motion || !SameLook(s, g_paintedState)) return PAINT_NOW;
+        need = PAINT_LAZY;
+    }
+    if (g_leftTab == 2 && pad->audioOn) return PAINT_NOW;
+    int mode = pad->set[S_LIGHTMODE];
+    if (mode == LIGHT_RAINBOW || mode == LIGHT_CHROMA || (AmbientActive() && g_ambientMoving)) return PAINT_SMOOTH;
+    return need;
 }
 
 static void ShowWindowFront() {
@@ -4991,7 +5051,13 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_TIMER:
-        if (Animating()) InvalidateRect(hwnd, nullptr, FALSE);
+        if (wp == 1 && !IsIconic(hwnd)) {   // (minimised: no painting, no work; restoring repaints)
+            static unsigned tick;
+            tick++;
+            int need = Animating();
+            if (need == PAINT_NOW || (need == PAINT_SMOOTH && tick % 2 == 0) || (need == PAINT_LAZY && tick % 15 == 0))
+                InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     case WM_MOUSEMOVE: {
         if (g_dragSlider >= 0) {
@@ -5222,7 +5288,20 @@ static DWORD WINAPI OverlayClock(void*) {
     return 0;
 }
 
+// Self-test: where an overlay frame's time goes (ms summed over g_overlayFrames): clear, glow,
+// controller, to straight alpha, sending.
+static double g_overlayPart[5];
+static LONGLONG OverlayTick() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static void OverlayPart(int part, LONGLONG& since) {
+    LONGLONG now = OverlayTick();
+    static LARGE_INTEGER f;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    g_overlayPart[part] += (now - since) * 1000.0 / f.QuadPart;
+    since = now;
+}
+
 static gp::Bitmap* RenderOverlay() {
+    LONGLONG tick = OverlayTick();
     static gp::Bitmap* image;
     if (!image) image = new gp::Bitmap(kOverlayW, kOverlayH, PixelFormat32bppPARGB);
     {
@@ -5231,17 +5310,13 @@ static gp::Bitmap* RenderOverlay() {
         og.SetTextRenderingHint(gp::TextRenderingHintAntiAliasGridFit);
         og.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
         og.Clear(gp::Color(0, 0, 0, 0));
+        og.Flush(gp::FlushIntentionSync);
+        OverlayPart(0, tick);
         Pad* pad = SelectedPad();
         if (pad) {
             AcquireSRWLockShared(&pad->lock);
             PadState s = pad->state;
             ReleaseSRWLockShared(&pad->lock);
-            if (!IsWindowVisible(g_window)) {   // the window animates these while it's open
-                UpdateAmbient(s, true);
-                float splitGoal = pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
-                g_split += (splitGoal - g_split) * 0.18f;
-                if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
-            }
             PadLayout L;
             L.scale = min(kOverlayW / (1000 + 6 * kOverlayReach), kOverlayH / (640 + 6 * kOverlayReach));
             L.x0 = (kOverlayW - 1000 * L.scale) / 2;
@@ -5251,9 +5326,11 @@ static gp::Bitmap* RenderOverlay() {
             g_overlayDrawing = true;
             static AmbientField overlayField;
             overlayField.reachPx = kOverlayReach * L.scale;
-
             DrawAmbient(og, L, (float)kOverlayW, (float)kOverlayH, overlayField);
+            OverlayPart(1, tick);
             DrawPad(og, L, s, PadLight(pad, s.battery), 1);
+            og.Flush(gp::FlushIntentionSync);
+            OverlayPart(2, tick);
             g_overlayDrawing = false;
             g_canvasGraphics = nullptr;
             g_canvas = nullptr;
@@ -5262,15 +5339,83 @@ static gp::Bitmap* RenderOverlay() {
     return image;
 }
 
+// Everything the overlay shows, to tell whether a frame would look the same as the last.
+struct OverlayLook {
+    Pad* pad;
+    BYTE lx, ly, rx, ry, l2, r2;
+    DWORD buttons;
+    bool touch[2];
+    short tx[2], ty[2];
+    int battery;
+    bool charging;
+    gp::ARGB light, ringColour;
+    float spot[ARRAYSIZE(kGlowSpots)], finger[2], fingerU[2], fingerV[2], ring, split;
+    int ringStyle;
+    bool touchSplit, touchRight;
+    ULONGLONG moving;                       // the ring's breathing or pulse: a new look every frame
+};
+
 static void SendOverlay() {
     g_overlayPending = false;
     if (!g_spout) return;
+    static std::vector<BYTE> pixels(kOverlayW * kOverlayH * 4);
+    static OverlayLook last;
+    static ULONGLONG lastSent;
+    OverlayLook look;
+    memset(&look, 0, sizeof(look));         // (padding too: compared bytewise)
+    Pad* pad = SelectedPad();
+    if (pad) {
+        AcquireSRWLockShared(&pad->lock);
+        PadState s = pad->state;
+        ReleaseSRWLockShared(&pad->lock);
+        if (!IsWindowVisible(g_window) || IsIconic(g_window)) {   // the window animates these while it's open (not minimised)
+            UpdateAmbient(s, true);
+            float splitGoal = pad->set[S_TPMOUSE] && pad->set[S_TPSPLIT] ? 1.0f : 0.0f;
+            g_split += (splitGoal - g_split) * 0.18f;
+            if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
+        }
+        look.pad = pad;
+        look.lx = s.lx; look.ly = s.ly; look.rx = s.rx; look.ry = s.ry; look.l2 = s.l2; look.r2 = s.r2;
+        look.buttons = s.buttons;
+        for (int i = 0; i < 2; i++) {
+            look.touch[i] = s.touch[i];
+            look.tx[i] = s.touch[i] ? s.tx[i] : 0;
+            look.ty[i] = s.touch[i] ? s.ty[i] : 0;
+            look.finger[i] = g_fingerLevel[i]; look.fingerU[i] = g_fingerU[i]; look.fingerV[i] = g_fingerV[i];
+        }
+        look.battery = s.battery;
+        look.charging = s.charging;
+        look.light = PadLight(pad, s.battery).GetValue();
+        for (int i = 0; i < (int)ARRAYSIZE(kGlowSpots); i++) look.spot[i] = g_spotLevel[i];
+        look.ring = g_ringLevel;
+        look.ringColour = g_ringColour.GetValue();
+        look.ringStyle = g_ringStyle;
+        look.split = g_split;
+        look.touchSplit = g_touchSplit;
+        look.touchRight = g_touchRight;
+        if (g_ringLevel > 0.004f && g_ringStyle != RING_FULL) look.moving = GetTickCount64();
+    }
+    // Nothing changed: nothing to draw. Receivers keep showing the last frame; it's sent again
+    // once a second all the same (for one that joins late).
+    ULONGLONG nowMs = GetTickCount64();
+    static unsigned frameTick;
+    frameTick++;
+    OverlayLook still = look;
+    still.moving = last.moving;
+    if (g_overlayFrames && look.moving && !memcmp(&still, &last, sizeof(look)) && frameTick % 2) return;   // only the slow ring moved: 30 fps
+    if (g_overlayFrames && !memcmp(&look, &last, sizeof(look))) {
+        if (nowMs - lastSent >= 1000) { g_spout->SendImage(pixels.data(), kOverlayW, kOverlayH); lastSent = nowMs; }
+        return;
+    }
+    last = look;
+    lastSent = nowMs;
+
     gp::Bitmap* image = RenderOverlay();
+    LONGLONG tick = OverlayTick();
     gp::Rect all(0, 0, kOverlayW, kOverlayH);
     gp::BitmapData data;
     if (image->LockBits(&all, gp::ImageLockModeRead, PixelFormat32bppPARGB, &data) != gp::Ok) return;
     // to straight alpha, which is what receivers take a BGRA sender's pixels as
-    static std::vector<BYTE> pixels(kOverlayW * kOverlayH * 4);
     static int unpremultiply[256];          // 65536 / alpha
     if (!unpremultiply[1]) for (int a = 1; a < 256; a++) unpremultiply[a] = (255 * 65536 + a / 2) / a;
     for (int y = 0; y < kOverlayH; y++) {
@@ -5288,7 +5433,9 @@ static void SendOverlay() {
         }
     }
     image->UnlockBits(&data);
+    OverlayPart(3, tick);
     g_spout->SendImage(pixels.data(), kOverlayW, kOverlayH);
+    OverlayPart(4, tick);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (!g_overlayFrames++) g_overlayFirst = now.QuadPart;
@@ -5522,6 +5669,12 @@ static void SelfTestFinish() {
                    g_spout->GetSenderCount(),
                    found ? L"listed" : L"MISSING", sw, sh, format, g_overlayMs, sentFrames, sentFor, sentFrames > 1 ? (sentFrames - 1) / sentFor : 0.0);
         status += line;
+        if (sentFrames) {
+            swprintf_s(line, L"  per frame: clear %.2f, glow %.2f, controller %.2f, straight alpha %.2f, send %.2f ms\n",
+                       g_overlayPart[0] / sentFrames, g_overlayPart[1] / sentFrames, g_overlayPart[2] / sentFrames,
+                       g_overlayPart[3] / sentFrames, g_overlayPart[4] / sentFrames);
+            status += line;
+        }
         for (int i = 0; i < g_spout->GetSenderCount(); i++)
             if (g_spout->GetSender(i, name)) { status += L"  - "; status += std::wstring(name, name + strlen(name)); status += L"\n"; }
     }
@@ -5670,6 +5823,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         if (demo && g_leftTab == 1) g_pads.back()->set[S_TPMOUSE] = 1;
         if (GetEnvironmentVariableW(L"DS4NATIVE_TASKBAR", env, MAX_PATH))   // a taskbar button, minimised, focus left alone
             ShowWindow(g_window, SW_SHOWMINNOACTIVE);
+        if (GetEnvironmentVariableW(L"DS4NATIVE_OFFSCREEN", env, MAX_PATH)) {   // open and painting, but off the screen, focus left alone
+            SetWindowPos(g_window, nullptr, -4000, -4000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(g_window, SW_SHOWNOACTIVATE);
+            SetTimer(g_window, 1, 16, nullptr);
+        }
         if (demo && g_leftTab == 2) {      // the Sound tab as it looks in use
             Pad* d = g_pads.back();
             d->set[S_AUDIO] = 1; d->set[S_TPMOUSE] = 0; d->set[S_TPVOLUME] = 1; d->set[S_MIC] = 1;
