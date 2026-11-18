@@ -3215,15 +3215,36 @@ static PadLayout LayoutPad(gp::RectF area) {
     return L;
 }
 
+// Drawing a generic gamepad (anything that isn't a DualShock 4): a plain gamepad shape with the
+// standard Xbox layout (A/B/X/Y, View/Menu/Guide, offset sticks), no touchpad or light bar.
+static bool g_genericLook;
+static const gp::Color kPadA(255, 96, 186, 70), kPadB(255, 236, 70, 60), kPadX(255, 60, 130, 236), kPadY(255, 244, 192, 40);
+
 static void PadBodyPath(gp::GraphicsPath& path, const PadLayout& L) {
     static const float pts[][2] = {
         { 250, 118 }, { 500, 108 }, { 750, 118 }, { 868, 150 }, { 938, 300 }, { 978, 480 }, { 940, 596 }, { 868, 606 },
         { 800, 520 }, { 716, 440 }, { 500, 428 }, { 284, 440 }, { 200, 520 }, { 132, 606 }, { 60, 596 }, { 22, 480 },
         { 62, 300 }, { 132, 150 },
     };
+    static const float genericPts[][2] = {      // a little broader, the middle dipping at the top
+        { 230, 128 }, { 500, 148 }, { 770, 128 }, { 880, 160 }, { 950, 300 }, { 985, 470 }, { 955, 592 }, { 880, 612 },
+        { 812, 548 }, { 730, 480 }, { 500, 470 }, { 270, 480 }, { 188, 548 }, { 120, 612 }, { 45, 592 }, { 15, 470 },
+        { 50, 300 }, { 120, 160 },
+    };
+    const float (*use)[2] = g_genericLook ? genericPts : pts;
     gp::PointF p[ARRAYSIZE(pts)];
-    for (int i = 0; i < (int)ARRAYSIZE(pts); i++) p[i] = gp::PointF(L.X(pts[i][0]), L.Y(pts[i][1]));
+    for (int i = 0; i < (int)ARRAYSIZE(pts); i++) p[i] = gp::PointF(L.X(use[i][0]), L.Y(use[i][1]));
     path.AddClosedCurve(p, ARRAYSIZE(pts), 0.42f);
+}
+
+// A lettered face button (the generic look): the letter in its colour, or the button lit in it.
+static void DrawLetterButton(gp::Graphics& g, const PadLayout& L, float cx, float cy, const wchar_t* letter, gp::Color colour, bool down) {
+    const Palette& p = Pal();
+    float r = L.U(30);
+    gp::RectF rc(L.X(cx) - r, L.Y(cy) - r, r * 2, r * 2);
+    gp::SolidBrush fill(down ? colour : Mix(p.body, p.text, 0.10f));
+    g.FillEllipse(&fill, rc);
+    Label(g, letter, g_fonts.body, down ? kWhite : colour, rc, gp::StringAlignmentCenter, gp::StringAlignmentCenter);
 }
 
 static void DrawFaceButton(gp::Graphics& g, const PadLayout& L, float cx, float cy, int symbol, gp::Color colour, bool down) {
@@ -3269,7 +3290,8 @@ static void DrawStick(gp::Graphics& g, const PadLayout& L, float cx, float cy, B
 struct OutlinePoint { float u, v, nu, nv; };
 
 static const std::vector<OutlinePoint>& DesignOutline() {
-    static std::vector<OutlinePoint> pts;
+    static std::vector<OutlinePoint> cache[2];
+    std::vector<OutlinePoint>& pts = cache[g_genericLook ? 1 : 0];
     if (!pts.empty()) return pts;
     PadLayout unit{ 0, 0, 1 };
     gp::GraphicsPath path;
@@ -3360,8 +3382,8 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
     gp::Color control = Mix(p.body, p.text, 0.10f);
     DWORD b = s.buttons;
 
-    DrawShoulders(g, L, 150, 330, s.l2, (b & B_L1) != 0, L"L1", L"L2");
-    DrawShoulders(g, L, 670, 850, s.r2, (b & B_R1) != 0, L"R1", L"R2");
+    DrawShoulders(g, L, 150, 330, s.l2, (b & B_L1) != 0, g_genericLook ? L"LB" : L"L1", g_genericLook ? L"LT" : L"L2");
+    DrawShoulders(g, L, 670, 850, s.r2, (b & B_R1) != 0, g_genericLook ? L"RB" : L"R1", g_genericLook ? L"RT" : L"R2");
 
     gp::GraphicsPath body;
     PadBodyPath(body, L);
@@ -3378,6 +3400,32 @@ static void DrawPad(gp::Graphics& g, const PadLayout& L, const PadState& s, gp::
             gp::Pen edge(p.bodyEdge, S(1.5));
             g.DrawPath(&edge, &body);
         }
+    }
+
+    if (g_genericLook) {
+        // Guide at the top of the middle, View and Menu either side under it.
+        {
+            gp::SolidBrush guide((b & B_PS) ? kAccent : control);
+            g.FillEllipse(&guide, L.R(466, 166, 68, 68));
+            gp::Pen ring(WithAlpha(p.text, (b & B_PS) ? 0 : 60), L.U(4));
+            g.DrawEllipse(&ring, L.R(482, 182, 36, 36));
+        }
+        FillRound(g, L.R(398, 234, 44, 26), L.U(13), (b & B_SHARE) ? kAccent : control);
+        FillRound(g, L.R(558, 234, 44, 26), L.U(13), (b & B_OPTIONS) ? kAccent : control);
+        // D-pad, lower left of the middle.
+        static const struct { DWORD bit; float x, y, w, h; } genericArms[] = {
+            { B_UP, 345, 297, 50, 60 }, { B_DOWN, 345, 383, 50, 60 }, { B_LEFT, 297, 345, 60, 50 }, { B_RIGHT, 383, 345, 60, 50 },
+        };
+        for (const auto& a : genericArms) FillRound(g, L.R(a.x, a.y, a.w, a.h), L.U(12), (b & a.bit) ? kAccent : control);
+        // A B X Y.
+        DrawLetterButton(g, L, 760, 182, L"Y", kPadY, (b & B_TRIANGLE) != 0);
+        DrawLetterButton(g, L, 828, 250, L"B", kPadB, (b & B_CIRCLE) != 0);
+        DrawLetterButton(g, L, 760, 318, L"A", kPadA, (b & B_CROSS) != 0);
+        DrawLetterButton(g, L, 692, 250, L"X", kPadX, (b & B_SQUARE) != 0);
+        // The left stick up top, the right one lower in the middle.
+        DrawStick(g, L, 250, 250, s.lx, s.ly, (b & B_L3) != 0);
+        DrawStick(g, L, 630, 370, s.rx, s.ry, (b & B_R3) != 0);
+        return;
     }
 
     // Light bar, along the top of the touchpad.
@@ -3467,6 +3515,17 @@ static const struct { DWORD bit; float u, v; int colour; int analog; } kGlowSpot
     { B_PS, 500, 390, GLOW_ACCENT, 0 },         { B_TOUCH, 500, 230, GLOW_ACCENT, 0 },
     { B_L3, 352, 390, GLOW_CONTRAST, 0 },       { B_R3, 648, 390, GLOW_CONTRAST, 0 },
 };
+// Where those are on the generic look (same order).
+static const float kGenericSpots[][2] = {
+    { 760, 182 }, { 828, 250 }, { 760, 318 }, { 692, 250 },
+    { 370, 327 }, { 370, 413 }, { 327, 370 }, { 413, 370 },
+    { 240, 112 }, { 760, 112 }, { 240, 76 }, { 760, 76 },
+    { 420, 247 }, { 580, 247 }, { 500, 200 }, { 500, 260 },
+    { 250, 250 }, { 630, 370 },
+};
+static_assert(ARRAYSIZE(kGenericSpots) == ARRAYSIZE(kGlowSpots), "one place per glow spot");
+static float SpotU(int i) { return g_genericLook ? kGenericSpots[i][0] : kGlowSpots[i].u; }
+static float SpotV(int i) { return g_genericLook ? kGenericSpots[i][1] : kGlowSpots[i].v; }
 static float g_spotLevel[ARRAYSIZE(kGlowSpots)];
 static float g_fingerLevel[2], g_fingerU[2], g_fingerV[2];
 static float g_ringLevel;               // the whole outline glows: pulsing on a low battery,
@@ -3475,6 +3534,12 @@ enum { RING_LOW, RING_CHARGING, RING_FULL };
 static gp::Color g_ringColour = kBatteryYellow;
 
 static gp::Color GlowColour(int which) {
+    if (g_genericLook) {                    // Y, B, A, X
+        if (which == GLOW_TRIANGLE) return kPadY;
+        if (which == GLOW_CIRCLE) return kPadB;
+        if (which == GLOW_CROSS) return kPadA;
+        if (which == GLOW_SQUARE) return kPadX;
+    }
     switch (which) {
     case GLOW_ACCENT:   return kAccent;
     case GLOW_TRIANGLE: return kTriangle;
@@ -3560,7 +3625,8 @@ static bool AmbientActive() {
 struct AmbientField {
     float reachPx = 0;                  // how far the glow reaches out (px; 0: the window's)
     float spread = 1;                   // how wide each light is, times the window's
-    float x0 = -1, y0, scale, reach;    // the layout (and reach) it was made for
+    float x0 = -1, y0, scale, reach;    // the layout (and reach, and look) it was made for
+    bool generic = false;
     int ox, oy, cols, rows;             // the field's place in the window (px) and size (cells)
     int step = kAmbientStep;            // cell size (px): coarser for a wider glow, which is smooth anyway
     std::vector<float> fade;            // exp(-distance outside the outline / reach)
@@ -3570,8 +3636,8 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
     if (!AmbientActive() || !g_canvas || &g != g_canvasGraphics) return;
 
     float reach = F.reachPx > 0 ? F.reachPx : S(kAmbientReach);
-    if (F.x0 != L.x0 || F.y0 != L.y0 || F.scale != L.scale || F.reach != reach) {
-        F.x0 = L.x0; F.y0 = L.y0; F.scale = L.scale; F.reach = reach;
+    if (F.x0 != L.x0 || F.y0 != L.y0 || F.scale != L.scale || F.reach != reach || F.generic != g_genericLook) {
+        F.x0 = L.x0; F.y0 = L.y0; F.scale = L.scale; F.reach = reach; F.generic = g_genericLook;
         gp::GraphicsPath path;
         PadBodyPath(path, L);
         path.Flatten(nullptr, 0.5f);
@@ -3613,9 +3679,9 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
     for (int i = 0; i < (int)ARRAYSIZE(kGlowSpots); i++) {
         if (!g_spotLevel[i]) continue;
         gp::Color c = GlowColour(kGlowSpots[i].colour);
-        float u = kGlowSpots[i].u;
+        float u = SpotU(i);
         if (kGlowSpots[i].bit == B_TOUCH && g_touchSplit) u = g_touchRight ? 585.0f : 415.0f;  // just the clicked side
-        sources[count++] = { u, kGlowSpots[i].v, g_spotLevel[i], (float)c.GetR(), (float)c.GetG(), (float)c.GetB() };
+        sources[count++] = { u, SpotV(i), g_spotLevel[i], (float)c.GetR(), (float)c.GetG(), (float)c.GetB() };
     }
     for (int i = 0; i < 2; i++) {
         if (!g_fingerLevel[i]) continue;
@@ -4525,7 +4591,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
         if (pad != g_mapPad) { g_mapPad = pad; g_mapButtons = s.buttons; g_mapText.clear(); }
         DWORD pressed = s.buttons & ~g_mapButtons;
         g_mapButtons = s.buttons;
-        bool mapping = pad && (pad->emulating || pad->fake) && g_enabled && pad->set[S_EMULATE];
+        bool mapping = pad && !pad->generic && (pad->emulating || pad->fake) && g_enabled && pad->set[S_EMULATE];   // (a generic pad has Xbox buttons already)
         for (const ButtonMap& m : kButtonMap) {
             if (!(pressed & m.pad) || g_recording || !mapping) continue;
             bool unmapped = m.pad == B_TOUCH && !pad->set[S_TOUCHBACK];
@@ -4556,6 +4622,7 @@ static void PaintWindow(HWND hwnd, HDC target) {
         if (fabsf(splitGoal - g_split) < 0.01f) g_split = splitGoal;
         UpdateAmbient(s, live);
         static AmbientField windowField;
+        g_genericLook = pad && pad->generic;
         DrawAmbient(g, layout, w, h, windowField);
 
         DrawTabs(g, m, S(10), w - 2 * m, pad);
@@ -4758,9 +4825,9 @@ static void PaintWindow(HWND hwnd, HDC target) {
                 return std::wstring(3 - text.size(), L'\x2007') + text;
             };
             wchar_t info[160];
-            swprintf_s(info, L"L  %s, %s   \x00B7   R  %s, %s   \x00B7   L2  %s   \x00B7   R2  %s",
+            swprintf_s(info, L"L  %s, %s   \x00B7   R  %s, %s   \x00B7   %s  %s   \x00B7   %s  %s",
                        axis(s.lx, false).c_str(), axis(s.ly, true).c_str(), axis(s.rx, false).c_str(), axis(s.ry, true).c_str(),
-                       trigger(s.l2).c_str(), trigger(s.r2).c_str());
+                       pad->generic ? L"LT" : L"L2", trigger(s.l2).c_str(), pad->generic ? L"RT" : L"R2", trigger(s.r2).c_str());
             Label(g, info, g_fonts.caption, p.subtext, gp::RectF(infoX, ty, infoW, S(18)), gp::StringAlignmentCenter);
             if (!g_mapText.empty() && now - g_mapTick < kMapShowMs) {
                 int alpha = (int)min(255.0, (kMapShowMs - (now - g_mapTick)) * 255.0 / 400);
@@ -5441,6 +5508,7 @@ static gp::Bitmap* RenderOverlay() {
             g_overlayDrawing = true;
             static AmbientField overlayField;
             overlayField.reachPx = kOverlayReach * L.scale;
+            g_genericLook = pad->generic;
             DrawAmbient(og, L, (float)kOverlayW, (float)kOverlayH, overlayField);
             OverlayPart(1, tick);
             DrawPad(og, L, s, PadLight(pad, s.battery), 1);
@@ -5709,6 +5777,12 @@ static void AddDemoPad() {
     p->state.touch[0] = true; p->state.tx[0] = 600; p->state.ty[0] = 400;
     p->state.battery = 62;
     wchar_t level[16];
+    if (GetEnvironmentVariableW(L"DS4NATIVE_GENERIC", level, 16)) {
+        p->generic = true;
+        p->name = L"Wireless Controller";
+        p->state.touch[0] = false;
+        p->state.buttons = B_CROSS | B_L1 | B_RIGHT | B_TRIANGLE;
+    }
     if (GetEnvironmentVariableW(L"DS4NATIVE_BATTERY", level, 16)) p->state.battery = _wtoi(level);
     if (GetEnvironmentVariableW(L"DS4NATIVE_CHARGING", level, 16)) p->state.charging = true;
     p->state.imu = true;
