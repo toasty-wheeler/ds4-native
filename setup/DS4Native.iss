@@ -28,6 +28,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\DS4Native.exe
+SetupIconFile=..\app\DS4Native.ico
 UninstallDisplayName=DS4-Native
 WizardStyle=modern
 CloseApplications=no

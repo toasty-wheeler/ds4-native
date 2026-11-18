@@ -4361,22 +4361,87 @@ static void DrawTabs(gp::Graphics& g, float x, float y, float width, Pad* select
     }
 }
 
+// The app's icon: a white gamepad on a soft glow (the tray's glow shows the battery).
+static void DrawAppIcon(gp::Bitmap& bmp, int size, gp::Color glow) {
+    gp::Graphics g(&bmp);
+    g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    g.Clear(gp::Color(0, 0, 0, 0));
+    float s = (float)size;
+    FillGlow(g, s * 0.5f, s * 0.5f, s * 0.5f, s * 0.5f, WithAlpha(glow, 255));
+    gp::SolidBrush white(kWhite);
+    FillRound(g, gp::RectF(s * 0.10f, s * 0.30f, s * 0.80f, s * 0.34f), s * 0.14f, kWhite);
+    g.FillEllipse(&white, s * 0.08f, s * 0.40f, s * 0.34f, s * 0.36f);
+    g.FillEllipse(&white, s * 0.58f, s * 0.40f, s * 0.34f, s * 0.36f);
+}
+
 static HICON MakeIcon(int size, gp::Color glow) {
     gp::Bitmap bmp(size, size, PixelFormat32bppARGB);
-    {
-        gp::Graphics g(&bmp);
-        g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
-        g.Clear(gp::Color(0, 0, 0, 0));
-        float s = (float)size;
-        FillGlow(g, s * 0.5f, s * 0.5f, s * 0.5f, s * 0.5f, WithAlpha(glow, 255));
-        gp::SolidBrush white(kWhite);
-        FillRound(g, gp::RectF(s * 0.10f, s * 0.30f, s * 0.80f, s * 0.34f), s * 0.14f, kWhite);
-        g.FillEllipse(&white, s * 0.08f, s * 0.40f, s * 0.34f, s * 0.36f);
-        g.FillEllipse(&white, s * 0.58f, s * 0.40f, s * 0.34f, s * 0.36f);
-    }
+    DrawAppIcon(bmp, size, glow);
     HICON icon = nullptr;
     bmp.GetHICON(&icon);
     return icon;
+}
+
+// `DS4Native.exe /makeicon file.ico` writes the icon (in the default blue) at the sizes Windows
+// uses, as the .ico the build puts into the exe (app\DS4Native.ico; rerun it if the drawing changes).
+static bool WriteIconFile(const wchar_t* path) {
+    static const int sizes[] = { 16, 20, 24, 32, 40, 48, 64, 96, 128, 256 };
+    CLSID png = { 0x557CF406, 0x1A04, 0x11D3, { 0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E } };
+    std::vector<std::vector<BYTE>> images;
+    for (int size : sizes) {
+        gp::Bitmap bmp(size, size, PixelFormat32bppARGB);
+        DrawAppIcon(bmp, size, gp::Color(255, 10, 132, 255));
+        if (size < 256) {                   // the classic form: a 32-bit DIB (bottom-up) and an empty AND mask
+            std::vector<BYTE> dib(40);
+            BITMAPINFOHEADER header{ sizeof(BITMAPINFOHEADER), size, size * 2, 1, 32, BI_RGB };
+            memcpy(dib.data(), &header, sizeof(header));
+            gp::Rect all(0, 0, size, size);
+            gp::BitmapData data;
+            if (bmp.LockBits(&all, gp::ImageLockModeRead, PixelFormat32bppARGB, &data) != gp::Ok) return false;
+            for (int y = size - 1; y >= 0; y--) {
+                const BYTE* row = (const BYTE*)data.Scan0 + y * data.Stride;
+                dib.insert(dib.end(), row, row + size * 4);
+            }
+            bmp.UnlockBits(&data);
+            dib.resize(dib.size() + ((size + 31) / 32) * 4 * size, 0);
+            images.push_back(std::move(dib));
+            continue;
+        }
+        IStream* stream = nullptr;
+        if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) return false;
+        bool saved = bmp.Save(stream, &png) == gp::Ok;
+        STATSTG stat{};
+        stream->Stat(&stat, STATFLAG_NONAME);
+        std::vector<BYTE> bytes((size_t)stat.cbSize.QuadPart);
+        LARGE_INTEGER zero{};
+        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+        ULONG read = 0;
+        stream->Read(bytes.data(), (ULONG)bytes.size(), &read);
+        stream->Release();
+        if (!saved || read != bytes.size()) return false;
+        images.push_back(std::move(bytes));
+    }
+    // ICONDIR, an entry per image (PNG-compressed, as Windows reads since Vista), then the images
+    std::vector<BYTE> file;
+    auto put16 = [&](unsigned v) { file.push_back((BYTE)v); file.push_back((BYTE)(v >> 8)); };
+    auto put32 = [&](unsigned v) { put16(v & 0xFFFF); put16(v >> 16); };
+    put16(0); put16(1); put16((unsigned)images.size());
+    unsigned offset = 6 + 16 * (unsigned)images.size();
+    for (size_t i = 0; i < images.size(); i++) {
+        file.push_back((BYTE)(sizes[i] >= 256 ? 0 : sizes[i]));
+        file.push_back((BYTE)(sizes[i] >= 256 ? 0 : sizes[i]));
+        file.push_back(0); file.push_back(0);
+        put16(1); put16(32);
+        put32((unsigned)images[i].size()); put32(offset);
+        offset += (unsigned)images[i].size();
+    }
+    for (const auto& image : images) file.insert(file.end(), image.begin(), image.end());
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool ok = WriteFile(h, file.data(), (DWORD)file.size(), &written, nullptr) && written == file.size();
+    CloseHandle(h);
+    return ok;
 }
 
 // ---- the shortcuts panel (a card over the window)
@@ -5915,6 +5980,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         if (file != INVALID_HANDLE_VALUE) { WriteFile(file, text, (DWORD)strlen(text), &written, nullptr); CloseHandle(file); }
         return 0;
     }
+    if (!wcsncmp(cmdLine, L"/makeicon ", 10)) {     // (building) write the icon file the exe carries
+        std::wstring path;
+        for (const wchar_t* c = cmdLine + 10; *c; c++) if (*c != L'"') path += *c;
+        while (!path.empty() && iswspace(path.back())) path.pop_back();
+        while (!path.empty() && iswspace(path.front())) path.erase(path.begin());
+        gp::GdiplusStartupInput input;
+        ULONG_PTR token;
+        gp::GdiplusStartup(&token, &input, nullptr);
+        bool ok = WriteIconFile(path.c_str());
+        gp::GdiplusShutdown(token);
+        return ok ? 0 : 1;
+    }
     if (!wcscmp(cmdLine, L"/exit")) {       // (the installer) close a running copy the normal way, so it
         HWND tray = FindWindowW(L"DS4NativeTray", nullptr);    // shows the controllers it hid again
         if (!tray) return 0;
@@ -5982,7 +6059,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     const wchar_t* trayClass = wc.lpszClassName;
     wc.lpfnWndProc = WindowProc;
     wc.lpszClassName = L"DS4NativeWindow";
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));     // the exe's icon (replaced by the live one once it's drawn)
     wc.style = CS_DBLCLKS;
     RegisterClassW(&wc);
 

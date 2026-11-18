@@ -1,0 +1,3 @@
+// The exe's icon (Explorer, shortcuts, the taskbar before the live icon is drawn).
+// DS4Native.ico is made by the app itself: DS4Native.exe /makeicon DS4Native.ico
+1 ICON "DS4Native.ico"

@@ -19,9 +19,11 @@ rem Spout2's sender (the stream overlay): its own step, it uses the narrow-chara
 cl /nologo /c /EHsc /O2 /W0 /std:c++17 /I"%SPOUT%\SpoutGL" /Foobj\ "%SPOUT%\SpoutDirectX\SpoutDX\SpoutDX.cpp" ^
    "%SPOUT%\SpoutGL\SpoutDirectX.cpp" "%SPOUT%\SpoutGL\SpoutSenderNames.cpp" "%SPOUT%\SpoutGL\SpoutSharedMemory.cpp" ^
    "%SPOUT%\SpoutGL\SpoutFrameCount.cpp" "%SPOUT%\SpoutGL\SpoutCopy.cpp" "%SPOUT%\SpoutGL\SpoutUtils.cpp" || exit /b 1
+rem The exe's icon.
+rc /nologo /fo obj\DS4Native.res DS4Native.rc || exit /b 1
 cl /nologo /EHsc /O2 /W3 /std:c++17 /DUNICODE /D_UNICODE /I"%VIGEM%\include" /I"%SPOUT%\SpoutGL" /I"%SPOUT%\SpoutDirectX\SpoutDX" ^
    /Foobj\ DS4Native.cpp "%VIGEM%\src\ViGEmClient.cpp" obj\SpoutDX.obj obj\SpoutDirectX.obj obj\SpoutSenderNames.obj ^
-   obj\SpoutSharedMemory.obj obj\SpoutFrameCount.obj obj\SpoutCopy.obj obj\SpoutUtils.obj ^
+   obj\SpoutSharedMemory.obj obj\SpoutFrameCount.obj obj\SpoutCopy.obj obj\SpoutUtils.obj obj\DS4Native.res ^
    /Fe:%OUT% /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED || exit /b 1
 echo.
 echo Built %OUT% - run it; it lives in the tray.
