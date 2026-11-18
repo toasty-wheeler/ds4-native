@@ -4,7 +4,7 @@ rem Needs Inno Setup 6 (iscc on PATH) and the GitHub CLI (gh) to fetch the bundl
 setlocal
 set NoDefaultCurrentDirectoryInExePath=
 cd /d "%~dp0"
-set VER=1.2.0
+set VER=1.2.1
 call ..\app\build.bat || exit /b 1
 cd /d "%~dp0"
 

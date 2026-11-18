@@ -5,7 +5,7 @@
 ; Both are Nefarius' own signed installers, run silently, and only when not installed already.
 
 #ifndef AppVer
-  #define AppVer "1.2.0"
+  #define AppVer "1.2.1"
 #endif
 #define ViGEmSetup "ViGEmBus_1.22.0_x64_x86_arm64.exe"
 #define HidHideSetup "HidHide_1.5.230_x64.exe"

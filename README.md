@@ -42,7 +42,13 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
   strength, so it shows the share of the controller's reports that actually arrive.
 - The window's taskbar button shows the selected controller's battery as its progress bar: green,
   yellow under 35 %, red under 15 %.
-- Light and dark themes (or follow Windows), always-on-top, start with Windows.
+- Switching a controller to an Xbox controller lights a green X that glows out from behind it.
+  The stick and trigger values under the controller stay put as they change, and the "Cross → A"
+  hints only show while it's actually an Xbox controller.
+- Switches, sliders and highlights take your Windows accent colour. Light and dark themes (or
+  follow Windows), always-on-top, start with Windows.
+- Repaints only what changes, at the rate it needs: nothing at all while the controller lies
+  still or the window is minimised.
 
 **Light bar**
 
@@ -100,12 +106,19 @@ One C++ file, Win32 and GDI+, no .NET or other runtime.
 - **Touchpad volume**: with the touchpad mouse off, the touchpad can be Windows' volume slider:
   slide right or up for louder, left or down for quieter (two fingers twice as fast), and press it
   to mute or unmute.
-- **Stream overlay**: the live controller preview, ambilight included, on a transparent
-  background as a [Spout2](https://spout.zeal.co/) source named "DS4-Native" (1440×1260, with room for the glow to fade out), for OBS
-  and other streaming or VJ software, at 60 fps. Turn on "Stream overlay" at the bottom of the window. It keeps
-  going with the window closed and shows the selected tab's controller. In OBS, install the free
-  [Spout2 plugin for OBS](https://github.com/Off-World-Live/obs-spout2-plugin), add a
-  "Spout2 Capture" source and pick DS4-Native.
+
+**Stream overlay (Spout2)**
+- The live controller preview, ambilight included, on a transparent background, as a
+  [Spout2](https://spout.zeal.co/) source named "DS4-Native" for OBS and other streaming or VJ
+  software: 1440×1260 at up to 60 fps, with room around the controller for its glow to fade out.
+- Turn on **Stream overlay** at the bottom of the window. It keeps going with the window closed and
+  shows the selected tab's controller.
+- In OBS, install the free [Spout2 plugin for OBS](https://github.com/Off-World-Live/obs-spout2-plugin),
+  add a **Spout2 Capture** source and pick DS4-Native.
+- Light on the CPU: a frame that would look the same as the last isn't drawn or sent, so a
+  controller lying still costs nothing.
+
+<p align="center"><img src="docs/overlay.png" width="560" alt="The stream overlay: the controller and its glow on a transparent background"></p>
 
 ## Install
 
