@@ -4367,6 +4367,8 @@ static void DrawShortcutPanel(gp::Graphics& g, float w, float h) {
 
 static std::wstring g_mapText;          // the last press, "Cross -> A", or a shortcut
 static ULONGLONG g_mapTick;
+static ULONGLONG g_xFlashTick;              // the Xbox controller was switched on (the green X)
+static const ULONGLONG kXFlashMs = 900;
 static DWORD g_mapButtons;
 static Pad* g_mapPad;
 static unsigned g_paintedSeq;
@@ -4435,8 +4437,9 @@ static void PaintWindow(HWND hwnd, HDC target) {
         if (pad != g_mapPad) { g_mapPad = pad; g_mapButtons = s.buttons; g_mapText.clear(); }
         DWORD pressed = s.buttons & ~g_mapButtons;
         g_mapButtons = s.buttons;
+        bool mapping = pad && (pad->emulating || pad->fake) && g_enabled && pad->set[S_EMULATE];
         for (const ButtonMap& m : kButtonMap) {
-            if (!(pressed & m.pad) || g_recording) continue;
+            if (!(pressed & m.pad) || g_recording || !mapping) continue;
             bool unmapped = m.pad == B_TOUCH && !pad->set[S_TOUCHBACK];
             g_mapText = std::wstring(m.from) + L"  \x2192  " + (unmapped ? L"nothing" : m.to);
             g_mapTick = now;
@@ -4644,12 +4647,38 @@ static void PaintWindow(HWND hwnd, HDC target) {
         // The controller; under it the raw values and the last mapping, and the motion card.
         DrawPad(g, layout, s, light, live ? (emulating ? 1.0f : 0.75f) : 0.4f);
         if (live && !pad->generic) DrawPad3D(g, preview, s, light, pad->set[S_MOTION] && s.imu, 1);   // drag to spin, double-click to level
+        if (g_xFlashTick && now - g_xFlashTick < kXFlashMs) {
+            float t = (now - g_xFlashTick) / (float)kXFlashMs, grow = 1 - (1 - t) * (1 - t) * (1 - t);
+            float fade = powf(1 - t, 1.5f);
+            float cx = layout.X(500), cy = layout.Y(330), arm = layout.U(60 + 330 * grow);
+            gp::Color green(255, 16, 200, 64);
+            FillGlow(g, cx, cy, arm * 1.6f, arm * 1.6f, WithAlpha(green, (int)(110 * fade)));
+            gp::Pen stroke(WithAlpha(green, (int)(235 * fade)), layout.U(64 - 34 * t));
+            stroke.SetStartCap(gp::LineCapRound);
+            stroke.SetEndCap(gp::LineCapRound);
+            g.DrawLine(&stroke, cx - arm, cy - arm, cx + arm, cy + arm);
+            g.DrawLine(&stroke, cx - arm, cy + arm, cx + arm, cy - arm);
+        }
         (void)previewElem;
         float infoX = cxl, infoW = cxr - cxl, ty = preview.Y + preview.Height + S(4);
         if (pad) {
+            // Same width whatever the values (so it doesn't shift about): a real minus is as wide
+            // as +, and figure spaces as wide as digits.
+            auto axis = [](BYTE raw, bool flip) {
+                double v = (raw - 127.5) / 127.5 * (flip ? -1 : 1);
+                if (fabs(v) < 0.005) v = 0;         // (the centre is between two values: no "-0.00")
+                wchar_t text[16];
+                swprintf_s(text, L"%c%.2f", v < 0 ? L'\x2212' : L'+', fabs(v));
+                return std::wstring(text);
+            };
+            auto trigger = [](BYTE raw) {
+                std::wstring text = std::to_wstring(raw);
+                return std::wstring(3 - text.size(), L'\x2007') + text;
+            };
             wchar_t info[160];
-            swprintf_s(info, L"L  %+.2f, %+.2f   \x00B7   R  %+.2f, %+.2f   \x00B7   L2  %d   \x00B7   R2  %d",
-                       (s.lx - 127.5) / 127.5, -(s.ly - 127.5) / 127.5, (s.rx - 127.5) / 127.5, -(s.ry - 127.5) / 127.5, s.l2, s.r2);
+            swprintf_s(info, L"L  %s, %s   \x00B7   R  %s, %s   \x00B7   L2  %s   \x00B7   R2  %s",
+                       axis(s.lx, false).c_str(), axis(s.ly, true).c_str(), axis(s.rx, false).c_str(), axis(s.ry, true).c_str(),
+                       trigger(s.l2).c_str(), trigger(s.r2).c_str());
             Label(g, info, g_fonts.caption, p.subtext, gp::RectF(infoX, ty, infoW, S(18)), gp::StringAlignmentCenter);
             if (!g_mapText.empty() && now - g_mapTick < kMapShowMs) {
                 int alpha = (int)min(255.0, (kMapShowMs - (now - g_mapTick)) * 255.0 / 400);
@@ -4845,7 +4874,10 @@ static void Activate(HWND hwnd, const Elem& e) {
             return;
         }
         if (e.id == kSlotEnabled) g_enabled = !g_enabled;
-        else if (pad) pad->set[e.id] = !pad->set[e.id];
+        else if (pad) {
+            pad->set[e.id] = !pad->set[e.id];
+            if (e.id == S_EMULATE && pad->set[S_EMULATE]) g_xFlashTick = GetTickCount64();
+        }
         break;
     case E_SEGMENT:
         if (e.id == SEG_LEFT_TAB) { g_leftTab = e.sub; g_twoMenuOpen = g_srcMenuOpen = g_micMenuOpen = false; return; }
@@ -4979,6 +5011,7 @@ static int Animating() {
     if (g_split != splitGoal) return PAINT_NOW;
     ULONGLONG now = GetTickCount64();
     if (now - g_mapTick < kMapShowMs + 100 || now < pad->testUntil + 100 || pad->rumbleStrong || pad->rumbleWeak) return PAINT_NOW;
+    if (g_xFlashTick && now - g_xFlashTick < kXFlashMs + 50) return PAINT_NOW;
     for (int slot = 0; slot <= kSlotSpout; slot++) {
         if (g_knob[slot] != (ToggleValue(slot) ? 1.0f : 0.0f)) return PAINT_NOW;
     }
@@ -5608,6 +5641,8 @@ static void AddDemoPad() {
 }
 
 static void SelfTestFinish() {
+    wchar_t flashAt[16];                    // DS4NATIVE_XFLASH=ms: the green X that far into its animation
+    if (GetEnvironmentVariableW(L"DS4NATIVE_XFLASH", flashAt, 16)) g_xFlashTick = GetTickCount64() - _wtoi(flashAt);
     LARGE_INTEGER sentAt;                   // the overlay's frame rate, before the timings below hold it up
     QueryPerformanceCounter(&sentAt);
     LONGLONG sentFrames = g_overlayFrames;
