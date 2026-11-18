@@ -3703,6 +3703,94 @@ static void DrawAmbient(gp::Graphics& g, const PadLayout& L, float w, float h, A
     g_canvas->UnlockBits(&data);
 }
 
+// A four-pointed X with sharp, tapering points, as light like the ambilight: the shape itself
+// glows (lime at the middle, greener out to the points) and a soft halo falls off around it.
+// `arm` is the centre-to-point length; `strength` 0..1. Blended into the window's canvas.
+static void DrawXGlow(gp::Graphics& g, float cx, float cy, float arm, float strength) {
+    if (!g_canvas || &g != g_canvasGraphics || strength <= 0.01f || arm < 4) return;
+    // The outline: from each notch between two points out to a point and back, the sides bowed
+    // in so the points are slim and sharp.
+    std::vector<gp::PointF> pts;
+    float notch = arm * 0.16f;
+    for (int k = 0; k < 4; k++) {
+        float a0 = k * kPi / 2, at = a0 + kPi / 4, a1 = a0 + kPi / 2;
+        gp::PointF v0(cx + notch * cosf(a0), cy + notch * sinf(a0)), v1(cx + notch * cosf(a1), cy + notch * sinf(a1));
+        gp::PointF tip(cx + arm * cosf(at), cy + arm * sinf(at));
+        float dx = cosf(at), dy = sinf(at);
+        auto side = [&](gp::PointF p, gp::PointF q) {
+            float mx = (p.X + q.X) / 2, my = (p.Y + q.Y) / 2;
+            float along = (mx - cx) * dx + (my - cy) * dy;
+            float ax = cx + dx * along, ay = cy + dy * along;           // the point's centre line
+            float kx = mx + (ax - mx) * 0.42f, ky = my + (ay - my) * 0.42f;
+            for (int i = 0; i < 10; i++) {
+                float s = i / 10.0f, u = 1 - s;
+                pts.push_back(gp::PointF(u * u * p.X + 2 * u * s * kx + s * s * q.X, u * u * p.Y + 2 * u * s * ky + s * s * q.Y));
+            }
+        };
+        side(v0, tip);
+        side(tip, v1);
+    }
+    float near_ = arm * 0.035f, far_ = arm * 0.14f, margin = far_ * 3;
+    static const float kFarEdge = expf(-3.0f);
+    float half = arm * 0.7072f + margin;
+    int W = (int)g_canvas->GetWidth(), H = (int)g_canvas->GetHeight();
+    int x0 = max(0, (int)(cx - half)), x1 = min(W, (int)(cx + half)), y0 = max(0, (int)(cy - half)), y1 = min(H, (int)(cy + half));
+    if (x1 <= x0 || y1 <= y0) return;
+    const int step = 6;
+    int cols = (x1 - x0) / step + 2, rows = (y1 - y0) / step + 2;
+    std::vector<float> ca(cols * rows), cr(cols * rows), cg(cols * rows), cb(cols * rows);
+    size_t n = pts.size();
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            float px = x0 + c * step + 0.5f, py = y0 + r * step + 0.5f;
+            float best = 1e30f;
+            bool inside = false;
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+                gp::PointF a = pts[j], b = pts[i];
+                if ((b.Y > py) != (a.Y > py) && px < (a.X - b.X) * (py - b.Y) / (a.Y - b.Y) + b.X) inside = !inside;
+                float ex = b.X - a.X, ey = b.Y - a.Y, len2 = ex * ex + ey * ey;
+                float tt = len2 > 0 ? max(0.0f, min(1.0f, ((px - a.X) * ex + (py - a.Y) * ey) / len2)) : 0;
+                float qx = a.X + ex * tt - px, qy = a.Y + ey * tt - py;
+                best = min(best, qx * qx + qy * qy);
+            }
+            float d = sqrtf(best);
+            float v = inside ? 0.85f
+                    : 0.5f * expf(-d / near_) + 0.35f * max(0.0f, (expf(-d / far_) - kFarEdge) / (1 - kFarEdge));
+            float a = min(1.0f, v * strength);
+            float rho = min(1.0f, sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy)) / (arm * 0.7072f));
+            size_t k = (size_t)r * cols + c;
+            ca[k] = a;                              // lime in the middle, green out to the points
+            cr[k] = (196 + (24 - 196) * rho) * a;
+            cg[k] = (238 + (176 - 238) * rho) * a;
+            cb[k] = (58 + (52 - 58) * rho) * a;
+        }
+    }
+    g_canvasGraphics->Flush(gp::FlushIntentionSync);
+    gp::Rect area(x0, y0, x1 - x0, y1 - y0);
+    gp::BitmapData data;
+    if (g_canvas->LockBits(&area, gp::ImageLockModeRead | gp::ImageLockModeWrite, PixelFormat32bppPARGB, &data) != gp::Ok) return;
+    const float inv = 1.0f / step;
+    for (int y = y0; y < y1; y++) {
+        int r = (y - y0) / step;
+        float ty = (y - y0 - r * step) * inv;
+        BYTE* px = (BYTE*)data.Scan0 + (y - y0) * data.Stride;
+        for (int x = x0; x < x1; x++, px += 4) {
+            int c = (x - x0) / step;
+            float tx = (x - x0 - c * step) * inv;
+            size_t k = (size_t)r * cols + c, k1 = k + 1, k2 = k + cols, k3 = k + cols + 1;
+            float w0 = (1 - tx) * (1 - ty), w1 = tx * (1 - ty), w2 = (1 - tx) * ty, w3 = tx * ty;
+            float a = ca[k] * w0 + ca[k1] * w1 + ca[k2] * w2 + ca[k3] * w3;
+            if (a < 0.002f) continue;
+            float keep = 1 - a;
+            px[0] = (BYTE)min(255.0f, cb[k] * w0 + cb[k1] * w1 + cb[k2] * w2 + cb[k3] * w3 + px[0] * keep + 0.5f);
+            px[1] = (BYTE)min(255.0f, cg[k] * w0 + cg[k1] * w1 + cg[k2] * w2 + cg[k3] * w3 + px[1] * keep + 0.5f);
+            px[2] = (BYTE)min(255.0f, cr[k] * w0 + cr[k1] * w1 + cr[k2] * w2 + cr[k3] * w3 + px[2] * keep + 0.5f);
+            px[3] = (BYTE)min(255.0f, 255 * a + px[3] * keep + 0.5f);
+        }
+    }
+    g_canvas->UnlockBits(&data);
+}
+
 struct V3 { float x, y, z; };
 static V3 operator+(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 static V3 operator-(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -4368,7 +4456,7 @@ static void DrawShortcutPanel(gp::Graphics& g, float w, float h) {
 static std::wstring g_mapText;          // the last press, "Cross -> A", or a shortcut
 static ULONGLONG g_mapTick;
 static ULONGLONG g_xFlashTick;              // the Xbox controller was switched on (the green X)
-static const ULONGLONG kXFlashMs = 900;
+static const ULONGLONG kXFlashMs = 1200;
 static DWORD g_mapButtons;
 static Pad* g_mapPad;
 static unsigned g_paintedSeq;
@@ -4645,20 +4733,14 @@ static void PaintWindow(HWND hwnd, HDC target) {
         g.DrawLine(&line, rx + S(16), y, rx + sideW, y);
         DrawSliderRow(g, gp::RectF(rx, y, sideW, S(kSliderRowH)), 6, lightLive && mode == LIGHT_RAINBOW);
         // The controller; under it the raw values and the last mapping, and the motion card.
+        if (g_xFlashTick && now - g_xFlashTick < kXFlashMs) {      // switched to an Xbox pad: a green X glows out
+            float t = (now - g_xFlashTick) / (float)kXFlashMs, grow = 1 - (1 - t) * (1 - t) * (1 - t);
+            float strength = t < 0.12f ? t / 0.12f : powf((1 - t) / 0.88f, 1.4f);
+            DrawXGlow(g, layout.X(500), layout.Y(330), layout.U(180 + 900 * grow), strength);
+        }
         DrawPad(g, layout, s, light, live ? (emulating ? 1.0f : 0.75f) : 0.4f);
         if (live && !pad->generic) DrawPad3D(g, preview, s, light, pad->set[S_MOTION] && s.imu, 1);   // drag to spin, double-click to level
-        if (g_xFlashTick && now - g_xFlashTick < kXFlashMs) {
-            float t = (now - g_xFlashTick) / (float)kXFlashMs, grow = 1 - (1 - t) * (1 - t) * (1 - t);
-            float fade = powf(1 - t, 1.5f);
-            float cx = layout.X(500), cy = layout.Y(330), arm = layout.U(60 + 330 * grow);
-            gp::Color green(255, 16, 200, 64);
-            FillGlow(g, cx, cy, arm * 1.6f, arm * 1.6f, WithAlpha(green, (int)(110 * fade)));
-            gp::Pen stroke(WithAlpha(green, (int)(235 * fade)), layout.U(64 - 34 * t));
-            stroke.SetStartCap(gp::LineCapRound);
-            stroke.SetEndCap(gp::LineCapRound);
-            g.DrawLine(&stroke, cx - arm, cy - arm, cx + arm, cy + arm);
-            g.DrawLine(&stroke, cx - arm, cy + arm, cx + arm, cy - arm);
-        }
+
         (void)previewElem;
         float infoX = cxl, infoW = cxr - cxl, ty = preview.Y + preview.Height + S(4);
         if (pad) {
